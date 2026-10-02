@@ -150,6 +150,13 @@ pub fn separate_streams(bytes: &[u8], page: usize) -> Result<Vec<u8>, String> {
     if streams.len() >= 100_000 {
       return Err("Слишком много объектов для редактирования.".into());
     }
+    // PDFium хранит преобразования только у потоков с командой cm. Без явной
+    // записи он может взять матрицу следующего потока и сместить правку страницы.
+    // Единичная матрица не меняет рисунок и фиксирует состояние каждой границы.
+    chunk.push(Op::new(
+      "cm",
+      vec![1.into(), 0.into(), 0.into(), 1.into(), 0.into(), 0.into()],
+    ));
     let bytes = Content {
       operations: std::mem::take(chunk),
     }
@@ -263,6 +270,130 @@ pub fn separate_streams(bytes: &[u8], page: usize) -> Result<Vec<u8>, String> {
   doc.prune_objects();
   let mut result = Vec::new();
   doc.save_to(&mut result).map_err(|e| e.to_string())?;
+  Ok(result)
+}
+
+pub fn retain_state_fonts(
+  original: &[u8],
+  edited: Vec<u8>,
+  page: usize,
+) -> Result<Vec<u8>, String> {
+  use lopdf::{Dictionary, Document, Object, ObjectId};
+  use std::collections::BTreeMap;
+
+  fn import(
+    value: &Object,
+    source: &Document,
+    target: &mut Document,
+    ids: &mut BTreeMap<ObjectId, ObjectId>,
+    depth: usize,
+  ) -> Result<Object, String> {
+    if depth > 64 || ids.len() > 100_000 {
+      return Err("Слишком сложная структура шрифта PDF.".into());
+    }
+    Ok(match value {
+      Object::Reference(id) => {
+        if let Some(id) = ids.get(id) {
+          return Ok(Object::Reference(*id));
+        }
+        let new_id = target.add_object(Object::Null);
+        ids.insert(*id, new_id);
+        let object = source.get_object(*id).map_err(|e| e.to_string())?;
+        let copy = import(object, source, target, ids, depth + 1)?;
+        target.objects.insert(new_id, copy);
+        Object::Reference(new_id)
+      }
+      Object::Array(values) => Object::Array(
+        values
+          .iter()
+          .map(|v| import(v, source, target, ids, depth + 1))
+          .collect::<Result<_, _>>()?,
+      ),
+      Object::Dictionary(dict) => {
+        let mut copy = Dictionary::new();
+        for (key, value) in dict.iter() {
+          copy.set(key.clone(), import(value, source, target, ids, depth + 1)?);
+        }
+        Object::Dictionary(copy)
+      }
+      Object::Stream(stream) => {
+        let mut copy = stream.clone();
+        copy.dict = import(
+          &Object::Dictionary(stream.dict.clone()),
+          source,
+          target,
+          ids,
+          depth + 1,
+        )?
+        .as_dict()
+        .map_err(|e| e.to_string())?
+        .clone();
+        Object::Stream(copy)
+      }
+      value => value.clone(),
+    })
+  }
+
+  let source = Document::load_mem(original).map_err(|e| e.to_string())?;
+  let mut target = Document::load_mem(&edited).map_err(|e| e.to_string())?;
+  let page_id = target.get_pages()[&(page as u32 + 1)];
+  let source_id = source.get_pages()[&(page as u32 + 1)];
+  let fonts = source
+    .get_page_fonts(source_id)
+    .map_err(|e| e.to_string())?;
+  let existing = target.get_page_fonts(page_id).map_err(|e| e.to_string())?;
+  let missing: Vec<_> = fonts
+    .into_iter()
+    .filter(|(name, _)| !existing.contains_key(name))
+    .collect();
+  if missing.is_empty() {
+    return Ok(edited);
+  }
+  // Генератор PDFium удаляет шрифты без рисуемых символов, хотя команды Tf
+  // могут остаться в неизменённых потоках. Возвращаем только их ресурсы.
+  let (direct, inherited) = target
+    .get_page_resources(page_id)
+    .map_err(|e| e.to_string())?;
+  let mut resources = direct
+    .cloned()
+    .or_else(|| {
+      inherited
+        .first()
+        .and_then(|id| target.get_dictionary(*id).ok())
+        .cloned()
+    })
+    .unwrap_or_default();
+  let mut font_resources = resources
+    .get(b"Font")
+    .ok()
+    .and_then(|o| target.dereference(o).ok())
+    .and_then(|(_, o)| o.as_dict().ok())
+    .cloned()
+    .unwrap_or_default();
+  let mut ids = BTreeMap::new();
+  for (name, font) in missing {
+    font_resources.set(
+      name,
+      import(
+        &Object::Dictionary(font.clone()),
+        &source,
+        &mut target,
+        &mut ids,
+        0,
+      )?,
+    );
+  }
+  resources.set("Font", font_resources);
+  target
+    .get_object_mut(page_id)
+    .and_then(Object::as_dict_mut)
+    .map_err(|e| e.to_string())?
+    .set("Resources", resources);
+  let mut result = Vec::new();
+  target.save_to(&mut result).map_err(|e| e.to_string())?;
+  if result.len() > 96_000_000 {
+    return Err("Изменённая копия превышает 96 МБ.".into());
+  }
   Ok(result)
 }
 

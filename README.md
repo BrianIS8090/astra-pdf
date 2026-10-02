@@ -7,15 +7,15 @@
 <p align="center">Нативный просмотрщик PDF для Windows 11 · Rust · PDFium</p>
 
 <p align="center">
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/tag/v1.0.0-rc.6"><img src="https://img.shields.io/badge/версия-1.0.0--rc.4-16758a" alt="Предварительный выпуск 1.0.0-rc.6"></a>
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/tag/v1.0.0-rc.7"><img src="https://img.shields.io/badge/версия-1.0.0--rc.7-16758a" alt="Предварительный выпуск 1.0.0-rc.7"></a>
   <img src="https://img.shields.io/badge/Windows_11-x64-0078d4" alt="Windows 11 x64">
   <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-25866a" alt="Лицензия MIT"></a>
   <a href="https://github.com/BrianIS8090/astra-pdf/actions/workflows/windows.yml"><img src="https://github.com/BrianIS8090/astra-pdf/actions/workflows/windows.yml/badge.svg" alt="Проверки Windows"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v1.0.0-rc.6/AstraPDF-1.0.0-rc.6-setup-x64.exe"><b>Установить для Windows 11</b></a> ·
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v1.0.0-rc.6/AstraPDF-1.0.0-rc.6-win-x64.zip">Переносимый ZIP</a> ·
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v1.0.0-rc.7/AstraPDF-1.0.0-rc.7-setup-x64.exe"><b>Установить для Windows 11</b></a> ·
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v1.0.0-rc.7/AstraPDF-1.0.0-rc.7-win-x64.zip">Переносимый ZIP</a> ·
   <a href="CHANGELOG.md">Что нового</a> ·
   <a href="TEST_REPORT.md">Результаты проверки</a> ·
   <a href="https://github.com/BrianIS8090/astra-pdf/issues/new/choose">Сообщить о проблеме</a>
@@ -23,7 +23,7 @@
 
 Лёгкий нативный просмотрщик PDF для Windows 11 x64. Интерфейс и управление написаны на Rust; страницы рисует PDFium. Браузерный движок и .NET для работы приложения не нужны.
 
-**1.0.0-rc.6 — предварительный выпуск.** Автоматические и интерактивные проверки описаны в [отчёте](TEST_REPORT.md). Сохранение выбранного диапазона через системный диалог печати ещё требует окончательной проверки; совместимость со всеми принтерами и компьютерами не подтверждена.
+**1.0.0-rc.7 — предварительный выпуск.** Автоматические и интерактивные проверки описаны в [отчёте](TEST_REPORT.md). Сохранение выбранного диапазона через системный диалог печати ещё требует окончательной проверки; совместимость со всеми принтерами и компьютерами не подтверждена.
 
 ![Миниатюры и непрерывная прокрутка в Astra PDF](docs/images/viewer.png)
 

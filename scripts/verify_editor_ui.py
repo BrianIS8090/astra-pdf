@@ -156,7 +156,10 @@ def verify(exe, fixture, output):
     viewer.dismiss(7)
     checks.append('floating_actions_open_text_and_delete_dialogs')
     viewer.command(15)
+    for _ in range(200):
+      send(canvas, 0x200, 0, point(*center))
     viewer.ready()
+    checks.append('idle_mouse_moves_do_not_stall_zoom_with_selected_object')
     assert state()['selected_object'] is not None
     for identifier in [42, 43]:
       rc, rb = w.RECT(), w.RECT()

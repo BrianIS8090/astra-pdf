@@ -35,7 +35,11 @@ impl Pdf {
     if let Operation::Text { page, .. } | Operation::Delete { page, .. } = operation {
       let bytes = crate::editing::separate_streams(&self._bytes, *page)?;
       let prepared = Pdf::open(self.api.clone(), Arc::new(bytes))?;
-      return prepared.edit_inner(operation);
+      return crate::editing::retain_state_fonts(
+        &self._bytes,
+        prepared.edit_inner(operation)?,
+        *page,
+      );
     }
     self.edit_inner(operation)
   }
@@ -276,17 +280,22 @@ impl Pdf {
           let ok = set_text(replacement, utf16.as_ptr()) != 0
             && set_matrix(replacement, &matrix) != 0
             && set_color(replacement, r, g, b, a) != 0;
-          if !ok || remove(page, object) == 0 {
+          if !ok {
             destroy(replacement);
             close_font(font);
             return Err("Замена текста не удалась.".into());
           }
-          destroy(object);
+          // Вставка наследует поток соседа. Пока исходный объект на месте,
+          // замена попадает в его поток и сохраняет порядок и окружение.
           if insert(page, replacement, object_index) == 0 {
-            destroy(replacement);
             close_font(font);
             return Err("Не удалось вставить новый текст.".into());
           }
+          if remove(page, object) == 0 {
+            close_font(font);
+            return Err("Не удалось заменить исходный текст.".into());
+          }
+          destroy(object);
           close_font(font);
         } else {
           if remove(page, object) == 0 {
@@ -329,6 +338,86 @@ mod tests {
     let mut result = Vec::new();
     doc.save_to(&mut result).unwrap();
     result
+  }
+
+  #[test]
+  fn editing_keeps_fonts_referenced_by_empty_text_state_blocks() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(
+      api,
+      Arc::new(with_content(
+        b"BT /F1 12 Tf ET BT /F1 18 Tf 40 700 Td (OLD) Tj ET",
+      )),
+    )
+    .unwrap();
+    for operation in [
+      Operation::Text {
+        page: 0,
+        object: 0,
+        text: "NEW".into(),
+      },
+      Operation::Delete { page: 0, object: 0 },
+    ] {
+      let changed = pdf.edit(&operation).unwrap();
+      let doc = lopdf::Document::load_mem(&changed).unwrap();
+      assert!(
+        doc
+          .get_page_fonts(doc.get_pages()[&1])
+          .unwrap()
+          .contains_key(b"F1".as_slice()),
+        "В команде Tf осталась ссылка на удалённый шрифт"
+      );
+    }
+  }
+
+  #[test]
+  fn deletion_before_later_transform_keeps_neighbor_rendering() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let suffix = "BT /F1 12 Tf 40 660 Td (KEEP) Tj ET q 1 0 0 1 250 300 cm 0 0 60 40 re f Q";
+    let source = with_content(format!("BT /F1 18 Tf 40 700 Td (OLD) Tj ET {suffix}").as_bytes());
+    let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+    let changed = pdf.edit(&Operation::Delete { page: 0, object: 0 }).unwrap();
+    let after = Pdf::open(api.clone(), Arc::new(changed)).unwrap();
+    let expected = Pdf::open(api, Arc::new(with_content(suffix.as_bytes()))).unwrap();
+    assert!(
+      after.render(0, 600, 800, 0, false).unwrap().pixels
+        == expected.render(0, 600, 800, 0, false).unwrap().pixels,
+      "Удаление изменило координаты соседей"
+    );
+  }
+
+  #[test]
+  fn replacement_before_later_transform_keeps_text_and_neighbors_in_place() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let source = with_content(b"BT /F1 18 Tf 40 700 Td (OLD) Tj ET BT /F1 12 Tf 40 660 Td (KEEP) Tj ET q 1 0 0 1 250 300 cm 0 0 60 40 re f Q");
+    let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+    let changed = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: 0,
+        text: "NEW".into(),
+      })
+      .unwrap();
+    let after = Pdf::open(api, Arc::new(changed)).unwrap();
+    let objects: Vec<PageObject> =
+      serde_json::from_slice(&after.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let original: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let keep = objects.iter().find(|o| o.text == "KEEP").unwrap();
+    assert_eq!(
+      keep.bounds, original[1].bounds,
+      "Соседний текст сместился после замены"
+    );
+    let replacement = objects.iter().find(|o| o.text == "NEW").unwrap();
+    assert!((replacement.bounds[0] - original[0].bounds[0]).abs() < 0.01);
+    assert!((replacement.bounds[1] - original[0].bounds[1]).abs() < 0.01);
+    let before_image = pdf.render(0, 600, 800, 0, false).unwrap();
+    let after_image = after.render(0, 600, 800, 0, false).unwrap();
+    assert_eq!(
+      &before_image.pixels[600 * 125 * 4..],
+      &after_image.pixels[600 * 125 * 4..],
+      "Правка изменила соседние элементы страницы"
+    );
   }
 
   #[test]

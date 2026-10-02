@@ -531,6 +531,11 @@ impl App {
     if self.editor.busy || self.printing || self.dialog_open {
       return;
     }
+    // Перестановка кнопок порождает новые сообщения мыши. Без активной рамки
+    // они не меняют редактор; повторная перерисовка может вытеснить таймер масштаба.
+    if msg != WM_LBUTTONDOWN && self.editor.drag.is_none() {
+      return;
+    }
     let point = ((lp as u16 as i16) as i32, ((lp >> 16) as u16 as i16) as i32);
     if msg == WM_LBUTTONDOWN {
       self.editor.selected_mask = None;
