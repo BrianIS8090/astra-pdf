@@ -26,6 +26,7 @@ use windows_sys::Win32::{
 };
 
 const OPEN: usize = 10;
+mod editor;
 const PRINT: usize = 11;
 const PREV: usize = 12;
 const NEXT: usize = 13;
@@ -58,6 +59,7 @@ struct ViewAnchor {
 thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) }; }
 
 struct App {
+  editor: editor::Editor,
   hwnd: HWND,
   canvas: HWND,
   controls: Vec<(usize, HWND)>,
@@ -464,14 +466,14 @@ impl App {
       let enabled = match *id {
         OPEN => !self.printing,
         TAB_PAGES | TAB_LAYERS | LAYER_NOTE => true,
-        CANCEL => self.printing,
+        CANCEL => self.printing || self.editor.busy,
         PREV => loaded && self.page > 0,
         NEXT => loaded && self.page + 1 < self.sizes.len(),
         PRINT => loaded && !self.printing,
         RESET | LAYER_LIST => !self.layers.is_empty() && !self.printing,
         _ => loaded,
       };
-      EnableWindow(*h, enabled as i32);
+      EnableWindow(*h, (enabled && (!self.editor.busy || *id == CANCEL)) as i32);
     }
   }
 
@@ -502,6 +504,7 @@ impl App {
   }
 
   unsafe fn open(&mut self, path: PathBuf) {
+    self.editor = editor::Editor::default();
     self.opened_at = std::time::Instant::now();
     self.first_frame_ms = None;
     self.last_error = false;
@@ -537,8 +540,9 @@ impl App {
     SendMessageW(self.control(PAGE_LIST), LB_RESETCONTENT, 0, 0);
     SendMessageW(self.control(LAYER_LIST), LVM_DELETEALLITEMS, 0, 0);
     let title = format!(
-      "{} — Astra PDF",
-      path.file_name().unwrap_or_default().to_string_lossy()
+      "{} — {}",
+      path.file_name().unwrap_or_default().to_string_lossy(),
+      crate::version::title()
     );
     SetWindowTextW(self.hwnd, wide(&title).as_ptr());
     if self
@@ -963,6 +967,18 @@ impl App {
   }
 
   unsafe fn action(&mut self, id: usize) {
+    if self.editor.busy && id != CANCEL {
+      return;
+    }
+    if (editor::PAGES..=51).contains(&id) {
+      PostMessageW(self.hwnd, WM_APP + 21, id, 0);
+      return;
+    }
+    if id == PRINT && !self.editor.masks.is_empty() {
+      self.editor.notice = Some("Есть несохранённые области скрытия. Сначала сохраните очищенный PDF и откройте его для печати.".into());
+      PostMessageW(self.hwnd, WM_APP + 23, 0, 0);
+      return;
+    }
     match id {
       OPEN if !self.dialog_open && !self.printing => {
         PostMessageW(self.hwnd, WM_APP + 12, 0, 0);
@@ -1029,7 +1045,7 @@ impl App {
       }
       CANCEL => {
         self.cancel.store(true, Ordering::Relaxed);
-        self.status = "Отменяю печать…".into();
+        self.status = "Отменяю операцию…".into();
       }
       PRINT if !self.sizes.is_empty() && !self.printing && !self.dialog_open => {
         PostMessageW(self.hwnd, WM_APP + 13, 0, 0);
@@ -1058,10 +1074,12 @@ impl App {
     while let Ok(event) = self.worker.receiver.try_recv() {
       match event {
         Event::Loaded {
+          fingerprint,
           generation,
           sizes,
           millis,
         } if generation == self.generation => {
+          self.editor.fingerprint = Some(fingerprint);
           self.sizes = sizes;
           self.status = format!("Открыто за {millis} мс · анализ слоёв…");
           let list = self.control(PAGE_LIST);
@@ -1325,6 +1343,7 @@ impl App {
         DT_CENTER,
       );
     }
+    self.editor_paint(mem);
     BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
     DeleteObject(bitmap);
@@ -1529,6 +1548,44 @@ impl App {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+  if msg == WM_APP + 21 {
+    editor::command(hwnd, wp);
+    return 0;
+  }
+  if msg == WM_APP + 22 {
+    with_app(|a| a.poll_job());
+    return 0;
+  }
+  if msg == WM_APP + 23 {
+    let message = with_app(|a| {
+      if a.dialog_open {
+        None
+      } else {
+        let text = a.editor.notice.take()?;
+        a.dialog_open = true;
+        Some(text)
+      }
+    })
+    .flatten();
+    if let Some(message) = message {
+      crate::dialogs::prompt(hwnd, "Astra PDF", "Результат операции", &message, true);
+      with_app(|a| a.dialog_open = false);
+    }
+    return 0;
+  }
+  if msg == WM_CLOSE {
+    let pending = with_app(|a| !a.editor.masks.is_empty() && !a.editor.busy).unwrap_or(false);
+    if pending
+      && MessageBoxW(
+        hwnd,
+        wide("Метки скрытия не сохраняются при закрытии. Закрыть окно?").as_ptr(),
+        wide("Закрыть документ").as_ptr(),
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+      ) != IDYES
+    {
+      return 0;
+    }
+  }
   if msg == WM_APP + 14 {
     let message = with_app(|a| {
       if a.dialog_open {
@@ -1556,7 +1613,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
   // Системные диалоги обслуживают сообщения окна и не должны удерживать его состояние.
   if msg == WM_APP + 12 {
     let allowed = with_app(|a| {
-      if a.dialog_open || a.printing {
+      if a.dialog_open || a.printing || a.editor.busy {
         false
       } else {
         a.dialog_open = true;
@@ -1566,6 +1623,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     .unwrap_or(false);
     if allowed {
       let result = App::choose_file(hwnd);
+      let discard = result.as_ref().is_ok_and(|p| p.is_some())
+        && with_app(|a| !a.editor.masks.is_empty()).unwrap_or(false);
+      if discard
+        && MessageBoxW(
+          hwnd,
+          wide("Метки скрытия текущего документа не сохранятся. Открыть другой документ?").as_ptr(),
+          wide("Открыть документ").as_ptr(),
+          MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) != IDYES
+      {
+        with_app(|a| a.dialog_open = false);
+        return 0;
+      }
       with_app(|a| {
         a.dialog_open = false;
         match result {
@@ -1580,7 +1650,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
   }
   if msg == WM_APP + 13 {
     let info = with_app(|a| {
-      if a.dialog_open || a.printing || a.sizes.is_empty() {
+      if a.dialog_open
+        || a.printing
+        || a.editor.busy
+        || !a.editor.masks.is_empty()
+        || a.sizes.is_empty()
+      {
         return None;
       }
       a.dialog_open = true;
@@ -1864,7 +1939,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       let mut value = vec![0u16; size as usize + 1];
       DragQueryFileW(drop, 0, value.as_mut_ptr(), value.len() as u32);
       DragFinish(drop);
-      if app.printing {
+      if app.printing || app.editor.busy || !app.editor.masks.is_empty() {
         return Some(0);
       }
       use std::os::windows::ffi::OsStringExt;
@@ -1898,9 +1973,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       app.request_thumbnails();
       Some(0)
     }
+    WM_TIMER if wp == 4 => {
+      app.poll_job();
+      Some(0)
+    }
     WM_CLOSE => {
       app.cancel.store(true, Ordering::Relaxed);
-      if app.printing {
+      if app.printing || app.editor.busy {
         app.closing = true;
         app.status = "Завершаю отмену печати…".into();
         InvalidateRect(hwnd, ptr::null(), 0);
@@ -1928,6 +2007,11 @@ unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
     WM_LBUTTONDOWN => {
       SetFocus(hwnd);
+      app.editor_mouse(msg, lp);
+      Some(0)
+    }
+    WM_MOUSEMOVE | WM_LBUTTONUP | WM_CAPTURECHANGED => {
+      app.editor_mouse(msg, lp);
       Some(0)
     }
     WM_VSCROLL | WM_HSCROLL => {
@@ -2062,7 +2146,7 @@ unsafe fn hotkey(msg: &MSG) -> bool {
       SetFocus(a.canvas);
       return true;
     }
-    if key == VK_ESCAPE && a.printing {
+    if key == VK_ESCAPE && (a.printing || a.editor.busy) {
       a.action(CANCEL);
       return true;
     }
@@ -2110,7 +2194,7 @@ pub fn run(
     let hwnd = CreateWindowExW(
       WS_EX_ACCEPTFILES,
       wide("AstraPdfWindow").as_ptr(),
-      wide("Astra PDF").as_ptr(),
+      wide(&crate::version::title()).as_ptr(),
       WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
       CW_USEDEFAULT,
       CW_USEDEFAULT,
@@ -2128,6 +2212,7 @@ pub fn run(
     DwmSetWindowAttribute(hwnd, 33, &corner as *const _ as _, 4);
     let worker = Worker::start(hwnd as usize, dll);
     let mut app = App {
+      editor: editor::Editor::default(),
       hwnd,
       canvas: ptr::null_mut(),
       controls: vec![],
@@ -2180,6 +2265,7 @@ pub fn run(
       anchor: None,
     };
     app.setup();
+    editor::menu(hwnd);
     let mut monitor: MONITORINFO = std::mem::zeroed();
     monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     GetMonitorInfoW(

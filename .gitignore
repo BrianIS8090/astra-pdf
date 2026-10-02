@@ -11,3 +11,5 @@ __pycache__/
 *.pfx
 *.p12
 *.key
+*.astrakey
+*.astravault

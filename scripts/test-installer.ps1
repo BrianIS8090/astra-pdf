@@ -20,8 +20,9 @@ $name = 'Astra PDF Installer Test'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8B24310F-20F8-494B-B9C8-3E40C37A5A5D}_is1'
 $programs = [Environment]::GetFolderPath('Programs')
 $desktop = [Environment]::GetFolderPath('DesktopDirectory')
-$shortcut = Join-Path $programs "$name\$name.lnk"
-$desktopShortcut = Join-Path $desktop "$name.lnk"
+$version = (Get-Content -LiteralPath "$payload\version.json" -Raw | ConvertFrom-Json).version
+$shortcut = Join-Path $programs "$name\$name $version.lnk"
+$desktopShortcut = Join-Path $desktop "$name $version.lnk"
 $settingsShortcut = Join-Path $programs "$name\Выбрать для PDF по умолчанию.url"
 $privateKeys = @("HKCU:\Software\$product", "HKCU:\Software\Classes\$product.Document", 'HKCU:\Software\Classes\Applications\AstraPDF-InstallerTest.exe', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\AstraPDF-InstallerTest.exe', $uninstallKey)
 $openWith = 'HKCU:\Software\Classes\.pdf\OpenWithProgids'
@@ -61,7 +62,8 @@ function Assert-Registration {
   $buffer.Clear() | Out-Null
   $length = 2048
   $result = [AstraInstaller.Associations]::AssocQueryString(0, 4, "$product.Document", 'open', $buffer, [ref]$length)
-  Assert-Check ($result -eq 0 -and $buffer.ToString() -eq $name) 'Windows возвращает правильное имя приложения для обработчика PDF'
+  $installedVersion = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
+  Assert-Check ($result -eq 0 -and $buffer.ToString() -in @($name, "$name $installedVersion")) 'Windows возвращает правильное имя приложения для обработчика PDF'
   Assert-Check ((Read-Choice) -eq $choiceBefore) 'Текущий выбор PDF по умолчанию сохранён'
   Assert-Check ((Read-Value 'HKCU:\Software\Classes\Applications\AstraPDF.exe\shell\open\command') -eq $productionCommandBefore) 'Рабочая регистрация Astra PDF не затронута тестом'
 }
@@ -101,6 +103,8 @@ try {
   Run-Checked $installerPath $arguments
   Assert-Registration
   Assert-Payload
+  Assert-Check (!(Test-Path -LiteralPath (Join-Path $programs "$name\$name.lnk"))) 'Старый ярлык без версии удалён'
+  Assert-Check ((Read-Value "HKCU:\Software\Classes\$product.Document\Application" 'ApplicationName') -eq "$name $version") 'В выборе PDF отображается новая версия'
   Assert-Check (Test-Path -LiteralPath $shortcut) 'Создан ярлык в меню Пуск'
   Assert-Check (Test-Path -LiteralPath $desktopShortcut) 'Создан выбранный ярлык рабочего стола'
   # Оболочка может вернуть короткое имя 8.3, особенно при кириллице в другой локали.

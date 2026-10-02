@@ -42,6 +42,8 @@ jobs:
           .\scripts\assemble.ps1 -Destination .\dist\installer-payload
           .\scripts\build-installer.ps1 -PayloadDirectory .\dist\installer-payload -TestIdentity
       - name: Проверить установку, восстановление и удаление
-        run: .\scripts\test-installer.ps1 -Installer .\dist\installer\AstraPDF-1.0.0-rc.3-setup-test-x64.exe -PayloadDirectory .\dist\installer-payload
+        run: |
+          $version = (Get-Content .\dist\installer-payload\version.json -Raw | ConvertFrom-Json).version
+          .\scripts\test-installer.ps1 -Installer ".\dist\installer\AstraPDF-$version-setup-test-x64.exe" -PayloadDirectory .\dist\installer-payload
       - name: Собрать установщик выпуска
         run: .\scripts\build-installer.ps1 -PayloadDirectory .\dist\installer-payload

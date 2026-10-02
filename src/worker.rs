@@ -43,6 +43,7 @@ pub enum Command {
 }
 pub enum Event {
   Loaded {
+    fingerprint: [u8; 32],
     generation: u64,
     sizes: Vec<(f64, f64)>,
     millis: u128,
@@ -261,6 +262,7 @@ impl Worker {
               Ok(meta) => {
                 sizes = meta.sizes;
                 send(Event::Loaded {
+                  fingerprint: meta.fingerprint,
                   generation,
                   sizes: sizes.clone(),
                   millis: start.elapsed().as_millis(),

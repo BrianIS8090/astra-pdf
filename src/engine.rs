@@ -38,12 +38,14 @@ pub struct Metadata {
 }
 
 enum Request {
+  Edit(crate::editing::Operation),
   Open(PathBuf),
   Render(RenderKey, bool),
   Probe(u8),
 }
 
 enum Reply {
+  Data(Vec<u8>),
   Opened(Metadata),
   Image(Raster),
   Error(String),
@@ -176,6 +178,7 @@ impl Request {
       Self::Open(_) => Packet::new(1),
       Self::Render(_, _) => Packet::new(2),
       Self::Probe(_) => Packet::new(3),
+      Self::Edit(_) => Packet::new(4),
     };
     match self {
       Self::Open(path) => {
@@ -203,6 +206,9 @@ impl Request {
         }
       }
       Self::Probe(mode) => p.byte(*mode),
+      Self::Edit(operation) => {
+        p.bytes(&serde_json::to_vec(operation).expect("Сериализация команды"))
+      }
     }
     p.0
   }
@@ -265,6 +271,12 @@ impl Request {
         )
       }
       3 => Self::Probe(c.byte()?),
+      4 => {
+        let n = c.count(MAX_REQUEST - 16)?;
+        Self::Edit(
+          serde_json::from_slice(c.take(n)?).map_err(|_| "Неверная команда редактирования.")?,
+        )
+      }
       _ => return Err("Неизвестная команда движка PDF.".into()),
     };
     c.end()?;
@@ -279,6 +291,7 @@ impl Reply {
       Self::Opened(_) => Packet::new(1),
       Self::Image(_) => Packet::new(2),
       Self::Ready => Packet::new(3),
+      Self::Data(_) => Packet::new(4),
     };
     match self {
       Self::Error(e) => p.text(e),
@@ -314,6 +327,7 @@ impl Reply {
         p.bytes(&image.pixels);
       }
       Self::Ready => (),
+      Self::Data(bytes) => p.bytes(bytes),
     }
     p.0
   }
@@ -383,6 +397,10 @@ impl Reply {
         })
       }
       3 => Self::Ready,
+      4 => {
+        let n = c.count(96_000_000)?;
+        Self::Data(c.take(n)?.to_vec())
+      }
       _ => return Err("Неизвестный ответ движка PDF.".into()),
     };
     c.end()?;
@@ -584,6 +602,18 @@ impl Client {
       }
     }
   }
+  pub fn open_checked(
+    &mut self,
+    path: &Path,
+    fingerprint: [u8; 32],
+    cancelled: impl Fn() -> bool,
+  ) -> Result<Metadata, String> {
+    let meta = self.open(path, cancelled)?;
+    if meta.fingerprint != fingerprint {
+      return Err("Исходный файл изменился после открытия. Откройте его повторно перед редактированием или скрытием.".into());
+    }
+    Ok(meta)
+  }
   pub fn render(
     &mut self,
     key: &RenderKey,
@@ -611,6 +641,16 @@ impl Client {
         self.stop();
         Err("Движок вернул неверный ответ отрисовки.".into())
       }
+    }
+  }
+  pub fn edit(
+    &mut self,
+    operation: crate::editing::Operation,
+    cancelled: impl Fn() -> bool,
+  ) -> Result<Vec<u8>, String> {
+    match self.call(Request::Edit(operation), REQUEST_TIMEOUT, cancelled)? {
+      Reply::Data(bytes) => Ok(bytes),
+      _ => Err("Движок вернул неверный результат редактирования.".into()),
     }
   }
 }
@@ -733,6 +773,14 @@ pub fn serve(diagnostics: bool) -> Result<(), String> {
               key.region,
             )?,
         ))
+      }
+      Request::Edit(operation) => {
+        let pdf = current.as_ref().ok_or("Документ не открыт.")?;
+        let copy = Pdf::open(
+          api.as_ref().ok_or("Движок не загружен.")?.clone(),
+          pdf.source_bytes(),
+        )?;
+        Ok(Reply::Data(copy.edit(&operation)?))
       }
       Request::Probe(mode) if diagnostics => {
         match mode {

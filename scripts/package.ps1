@@ -30,7 +30,7 @@ $zip = Join-Path $release ('AstraPDF-' + $version + '-win-x64.zip')
 Compress-Archive -Path $outputDir -DestinationPath $zip
 $sourceDir = Join-Path $release 'source\astra-pdf'
 New-Item -ItemType Directory -Path $sourceDir | Out-Null
-foreach ($name in @('src','scripts','assets','.cargo','Cargo.toml','Cargo.lock','build.rs','rust-toolchain.toml','rustfmt.toml','.gitignore','README.md','TEST_REPORT.md','RELEASE_PLAN.md','LICENSE')) {
+foreach ($name in @('src','scripts','assets','docs','installer','.cargo','.github','Cargo.toml','Cargo.lock','build.rs','rust-toolchain.toml','rustfmt.toml','.gitignore','.gitattributes','CHANGELOG.md','README.md','TEST_REPORT.md','RELEASE_PLAN.md','LICENSE')) {
   Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $sourceDir -Recurse
 }
 # Кэш Python не является исходным кодом и в архив не включается.

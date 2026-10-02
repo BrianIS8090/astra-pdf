@@ -1,4 +1,5 @@
 use crate::model::Region;
+mod edit;
 use libloading::Library;
 use std::{cell::RefCell, collections::VecDeque, ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};
 
@@ -86,6 +87,9 @@ pub struct Raster {
 }
 
 impl Pdf {
+  pub fn source_bytes(&self) -> Arc<Vec<u8>> {
+    self._bytes.clone()
+  }
   pub fn open(api: Rc<Api>, bytes: Arc<Vec<u8>>) -> Result<Self, String> {
     unsafe {
       let handle = (api.load)(bytes.as_ptr().cast(), bytes.len(), ptr::null());

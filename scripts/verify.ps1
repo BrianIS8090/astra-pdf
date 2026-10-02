@@ -25,7 +25,7 @@ function Invoke-Viewer([string[]]$Arguments) {
 function Quoted([string]$Value) { return '"' + $Value + '"' }
 function Source-Hashes {
   $files = @(Get-ChildItem "$projectRoot\src", "$projectRoot\scripts", "$projectRoot\.cargo", "$projectRoot\assets" -File -Recurse | Where-Object { $_.Extension -notin @('.pyc') })
-  $files += @(Get-Item "$projectRoot\Cargo.toml", "$projectRoot\Cargo.lock", "$projectRoot\build.rs", "$projectRoot\rust-toolchain.toml", "$projectRoot\rustfmt.toml")
+  $files += @(Get-Item "$projectRoot\Cargo.toml", "$projectRoot\Cargo.lock", "$projectRoot\build.rs", "$projectRoot\rust-toolchain.toml", "$projectRoot\rustfmt.toml", "$projectRoot\CHANGELOG.md", "$projectRoot\docs\EDITING.txt")
   return @($files | Sort-Object FullName | ForEach-Object { @{ file = $_.FullName.Substring($projectRoot.Length + 1); sha256 = (Get-FileHash -LiteralPath $_.FullName).Hash } })
 }
 Push-Location $projectRoot
@@ -49,6 +49,8 @@ try {
   $sourceHash = (Get-FileHash -LiteralPath $demo).Hash
   Copy-Item -LiteralPath $demo -Destination "$portable\Демонстрация-слоёв.pdf"
   Invoke-Viewer @('--engine-selftest', (Quoted $demo), (Quoted "$outputDir\engine.json"))
+  & $Python "$PSScriptRoot\verify_editing.py" $exe "$outputDir\editing"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла независимая проверка редактирования и очистки PDF' }
   $env:ASTRA_SMOKE_PRINT = '1'
   Invoke-Viewer @('--ui-smoke', (Quoted $demo), (Quoted "$outputDir\window.png"))
   $env:ASTRA_SMOKE_PRINT = $null

@@ -1,6 +1,10 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod dialogs;
+mod editing;
+mod editing_check;
 mod engine;
+mod export;
 mod fixture;
 mod layers;
 mod layout;
@@ -9,6 +13,10 @@ mod pdf;
 mod print_pipeline;
 mod printing;
 mod ui;
+mod vault;
+mod version;
+#[cfg(test)]
+mod version_number;
 mod worker;
 
 use std::{
@@ -50,6 +58,7 @@ fn start() -> Result<(), String> {
   let args: Vec<_> = std::env::args_os().skip(1).collect();
   match args.first().and_then(|s| s.to_str()) {
     Some("--engine") => engine::serve(false),
+    Some("--editing-selftest") if args.len() == 2 => editing_check::run(&PathBuf::from(&args[1])),
     Some("--engine-diagnostics") => engine::serve(true),
     Some("--engine-selftest") if args.len() == 3 => engine::self_test(&PathBuf::from(&args[1]), &PathBuf::from(&args[2])),
     Some("--demo") if args.len() == 2 => std::fs::write(&args[1], fixture::demo()).map_err(|e| e.to_string()),

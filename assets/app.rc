@@ -1,8 +1,8 @@
-1 24 "assets/app.manifest"
-101 ICON "assets/app.ico"
+1 24 "@MANIFEST@"
+101 ICON "@ICON@"
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION @WINDOWS_COMMA@
+PRODUCTVERSION @WINDOWS_COMMA@
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -10,10 +10,10 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "FileDescription", "Astra PDF"
+      VALUE "FileDescription", "Astra PDF @VERSION@"
       VALUE "ProductName", "Astra PDF"
-      VALUE "FileVersion", "1.0.0-rc.3"
-      VALUE "ProductVersion", "1.0.0-rc.3"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "ProductVersion", "@VERSION@"
     END
   END
   BLOCK "VarFileInfo"

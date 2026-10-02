@@ -10,6 +10,8 @@ Copy-Item "$projectRoot\vendor\pdfium\LICENSE" "$outputDir\PDFium-LICENSE.txt"
 Copy-Item "$projectRoot\vendor\pdfium\licenses" "$outputDir\licenses" -Recurse
 Copy-Item "$projectRoot\LICENSE" "$outputDir\LICENSE.txt"
 Copy-Item "$projectRoot\README.md" $outputDir
+Copy-Item "$projectRoot\CHANGELOG.md" $outputDir
+Copy-Item "$projectRoot\docs\EDITING.txt" $outputDir
 $env:CARGO_HOME = Join-Path $projectRoot 'tools\cargo'
 $env:RUSTUP_HOME = Join-Path $projectRoot 'tools\rustup'
 $metadataText = & "$projectRoot\tools\cargo\bin\cargo.exe" metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-gnu --manifest-path "$projectRoot\Cargo.toml"
@@ -33,7 +35,5 @@ Copy-Item "$projectRoot\tools\w64devkit\COPYING.MinGW-w64-runtime.txt" "$outputD
 Copy-Item "$projectRoot\tools\rustup\toolchains\1.99.0-x86_64-pc-windows-gnu\share\doc\COPYING.RUNTIME" "$outputDir\licenses\GCC-RUNTIME.txt"
 Copy-Item "$projectRoot\tools\rustup\toolchains\1.99.0-x86_64-pc-windows-gnu\share\doc\COPYING3" "$outputDir\licenses\GCC-GPL3.txt"
 $package = $metadata.packages | Where-Object { $_.name -eq 'astra-pdf' }
-$manifest = [xml](Get-Content "$projectRoot\assets\app.manifest" -Raw)
-if ($manifest.assembly.assemblyIdentity.version -ne ($package.version.Split('-')[0] + '.0')) { throw 'Версия манифеста не совпадает с Cargo.toml' }
 if ((Get-Item "$outputDir\AstraPDF.exe").VersionInfo.FileVersion -ne $package.version) { throw 'Версия ресурса EXE не совпадает с Cargo.toml' }
 @{ version = $package.version; pdfium = '156.0.8076.0'; platform = 'Windows 11 x64'; built_at = [DateTime]::UtcNow.ToString('o'); source_lock_sha256 = (Get-FileHash "$projectRoot\Cargo.lock").Hash } | ConvertTo-Json | Set-Content "$outputDir\version.json" -Encoding UTF8

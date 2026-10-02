@@ -51,7 +51,7 @@ DisableWelcomePage=no
 DisableDirPage=auto
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
-UninstallDisplayName={#ProductName}
+UninstallDisplayName={#ProductName} {#AppVersion} (предварительная)
 UninstallDisplayIcon={app}\{#ExeName}
 SetupIconFile=..\assets\app.ico
 WizardStyle=modern
@@ -81,27 +81,27 @@ Source: "{#PayloadDir}\*"; DestDir: "{app}"; Excludes: "AstraPDF.exe,SHA256.json
 Source: "INSTALLATION.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{userprograms}\{#ProductName}\{#ProductName}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"
+Name: "{userprograms}\{#ProductName}\{#ProductName} {#AppVersion}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"; Comment: "Предварительная версия {#AppVersion}"
 Name: "{userprograms}\{#ProductName}\Выбрать для PDF по умолчанию"; Filename: "{#DefaultSettings}"; IconFilename: "{app}\{#ExeName}"
-Name: "{userdesktop}\{#ProductName}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{userdesktop}\{#ProductName} {#AppVersion}"; Filename: "{app}\{#ExeName}"; WorkingDir: "{app}"; Tasks: desktopicon; Comment: "Предварительная версия {#AppVersion}"
 
 [Registry]
 ; Только собственная регистрация; выбор пользователя в Windows не перезаписывается.
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}"; ValueType: string; ValueData: "PDF-документ {#ProductName}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}"; ValueName: "FriendlyTypeName"; Flags: deletevalue
-Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#ProductName}"
+Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#ProductName} {#AppVersion}"
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\Application"; ValueType: string; ValueName: "ApplicationCompany"; ValueData: "Astra PDF contributors"
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\Application"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Просмотр PDF, слои, чертежи и печать"
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\{#ExeName}"",0"
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\DefaultIcon"; ValueType: string; ValueData: """{app}\{#ExeName}"",0"
 Root: HKCU; Subkey: "Software\Classes\{#DocumentId}\shell\open\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "{#DocumentId}"; ValueData: ""; Flags: uninsdeletevalue uninsdeletekeyifempty
-Root: HKCU; Subkey: "Software\Classes\Applications\{#ExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#ProductName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Applications\{#ExeName}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#ProductName} {#AppVersion}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Applications\{#ExeName}\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\Applications\{#ExeName}\DefaultIcon"; ValueType: string; ValueData: """{app}\{#ExeName}"",0"
 Root: HKCU; Subkey: "Software\Classes\Applications\{#ExeName}\shell\open\command"; ValueType: string; ValueData: """{app}\{#ExeName}"" ""%1"""
 Root: HKCU; Subkey: "Software\{#ProductId}"; Flags: uninsdeletekeyifempty
-Root: HKCU; Subkey: "Software\{#ProductId}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#ProductName}"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\{#ProductId}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#ProductName} {#AppVersion}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\{#ProductId}\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Просмотр PDF, миниатюры страниц, слои, чертежи и печать"
 Root: HKCU; Subkey: "Software\{#ProductId}\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\{#ExeName}"",0"
 Root: HKCU; Subkey: "Software\{#ProductId}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "{#DocumentId}"
@@ -111,3 +111,40 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\{#ExeNa
 [Run]
 Filename: "{#DefaultSettings}"; Description: "Выбрать Astra PDF для PDF по умолчанию"; Flags: postinstall shellexec nowait skipifsilent
 Filename: "{app}\{#ExeName}"; Description: "Запустить Astra PDF"; Flags: postinstall nowait skipifsilent unchecked
+
+[Code]
+var PreviousShortcutVersion: String;
+
+function InitializeSetup(): Boolean;
+var I: Integer;
+begin
+  PreviousShortcutVersion := GetPreviousData('ShortcutVersion', '');
+  if Length(PreviousShortcutVersion) > 40 then PreviousShortcutVersion := '';
+  for I := 1 to Length(PreviousShortcutVersion) do
+    if Pos(PreviousShortcutVersion[I], '0123456789abcdefghijklmnopqrstuvwxyz.-') = 0 then
+    begin
+      PreviousShortcutVersion := '';
+      Break;
+    end;
+  Result := True;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    { Удаляются только собственные ярлыки прежнего установщика. }
+    DeleteFile(ExpandConstant('{userprograms}\{#ProductName}\{#ProductName}.lnk'));
+    DeleteFile(ExpandConstant('{userdesktop}\{#ProductName}.lnk'));
+    if (PreviousShortcutVersion <> '') and (PreviousShortcutVersion <> '{#AppVersion}') then
+    begin
+      DeleteFile(ExpandConstant('{userprograms}\{#ProductName}\{#ProductName} ') + PreviousShortcutVersion + '.lnk');
+      DeleteFile(ExpandConstant('{userdesktop}\{#ProductName} ') + PreviousShortcutVersion + '.lnk');
+    end;
+  end;
+end;
+
+procedure RegisterPreviousData(PreviousDataKey: Integer);
+begin
+  SetPreviousData(PreviousDataKey, 'ShortcutVersion', '{#AppVersion}');
+end;

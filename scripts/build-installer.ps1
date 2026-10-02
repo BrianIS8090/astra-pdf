@@ -15,7 +15,8 @@ foreach ($name in @('AstraPDF.exe', 'pdfium.dll', 'version.json', 'LICENSE.txt',
 }
 $version = (Get-Content -LiteralPath "$payload\version.json" -Raw | ConvertFrom-Json).version
 if ($version -notmatch '^([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9.-]+)?$') { throw 'Некорректная версия комплекта' }
-$numbers = $Matches[1] + '.0'
+$exeVersion = (Get-Item -LiteralPath "$payload\AstraPDF.exe").VersionInfo
+$numbers = @($exeVersion.FileMajorPart, $exeVersion.FileMinorPart, $exeVersion.FileBuildPart, $exeVersion.FilePrivatePart) -join '.'
 if ((Get-Item -LiteralPath "$payload\AstraPDF.exe").VersionInfo.FileVersion -ne $version) { throw 'Версия EXE не совпала с комплектом' }
 if (Test-Path -LiteralPath "$payload\SHA256.json") {
   $hashes = Get-Content -LiteralPath "$payload\SHA256.json" -Raw | ConvertFrom-Json
