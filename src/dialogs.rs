@@ -200,9 +200,9 @@ pub unsafe fn file(
   suggested: &Path,
   save: bool,
 ) -> Option<PathBuf> {
-  use std::os::windows::ffi::{OsStrExt, OsStringExt};
+  use std::os::windows::ffi::OsStringExt;
   let mut name = vec![0u16; 32768];
-  let initial: Vec<_> = suggested.as_os_str().encode_wide().collect();
+  let initial = dialog_path(suggested);
   if initial.len() >= name.len() {
     return None;
   }
@@ -232,8 +232,44 @@ pub unsafe fn file(
     GetOpenFileNameW(&mut info)
   };
   if result == 0 {
+    let error = CommDlgExtendedError();
+    if error != 0 {
+      MessageBoxW(
+        owner,
+        wide(&format!(
+          "Не удалось открыть окно выбора файла (код Windows: {error:#x})."
+        ))
+        .as_ptr(),
+        wide("Astra PDF").as_ptr(),
+        MB_OK | MB_ICONERROR,
+      );
+    }
     return None;
   }
   let n = name.iter().position(|&c| c == 0)?;
   Some(std::ffi::OsString::from_wide(&name[..n]).into())
+}
+
+fn dialog_path(path: &Path) -> Vec<u16> {
+  use std::os::windows::ffi::OsStrExt;
+  // Общий диалог Windows не принимает смешанные разделители в начальном имени.
+  path
+    .as_os_str()
+    .encode_wide()
+    .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  #[test]
+  fn native_file_dialog_paths_normalize_slashes_and_keep_unicode() {
+    let value = super::dialog_path(std::path::Path::new(
+      "C:/Users/Test/AstraPDF/Private\\Originals/оригинал.astravault",
+    ));
+    assert_eq!(
+      String::from_utf16(&value).unwrap(),
+      "C:\\Users\\Test\\AstraPDF\\Private\\Originals\\оригинал.astravault"
+    );
+  }
 }

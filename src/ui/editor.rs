@@ -575,7 +575,8 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
 fn private_dir() -> Result<PathBuf, String> {
   Ok(
     PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("Не найден личный каталог Windows.")?)
-      .join("AstraPDF/Private"),
+      .join("AstraPDF")
+      .join("Private"),
   )
 }
 
@@ -605,7 +606,7 @@ unsafe fn restore(hwnd: HWND) {
     hwnd,
     "Выберите защищённый оригинал",
     "astravault",
-    &private.join("Originals/оригинал.astravault"),
+    &private.join("Originals").join("оригинал.astravault"),
     false,
   ) else {
     return;
@@ -614,7 +615,7 @@ unsafe fn restore(hwnd: HWND) {
     hwnd,
     "Выберите ключ восстановления",
     "astrakey",
-    &private.join("Keys/ключ.astrakey"),
+    &private.join("Keys").join("ключ.astrakey"),
     false,
   ) else {
     return;
