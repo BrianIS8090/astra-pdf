@@ -57,7 +57,7 @@ fn start() -> Result<(), String> {
       let mut engine = engine::Client::spawn(&pdfium_path())?;
       let meta = engine.open(&PathBuf::from(&args[1]), || false)?;
       let (w, h, _) = model::render_size(meta.sizes[0], (1000, 1200), model::Zoom::FitPage, 96., 0);
-      let key = model::RenderKey { page: 0, width: w, height: h, rotation: 0, states: meta.layers.iter().map(|l| l.visible).collect() };
+      let key = model::RenderKey { page: 0, width: w, height: h, rotation: 0, states: meta.layers.iter().map(|l| l.visible).collect(), region: None };
       engine.render(&key, false, || false)?.save_png(&PathBuf::from(&args[2]))
     }
     Some("--print-to-pdf") if args.len() == 3 => {
@@ -69,7 +69,7 @@ fn start() -> Result<(), String> {
         if dc.is_null() { return Err("Не установлен принтер Microsoft Print to PDF.".into()); }
         let job = printing::PrintJob { dc: dc as usize, first: 0, last: meta.sizes.len() - 1, title: "Astra PDF — проверка печати".into(), output: Some(args[2].to_string_lossy().into_owned()), cancel: Arc::new(AtomicBool::new(false)) };
         let states: Vec<bool> = meta.layers.iter().map(|l| l.visible).collect();
-        printing::print(&meta.sizes, job, 0, |page, width, height, rotation| engine.render(&model::RenderKey { page, width, height, rotation, states: states.clone() }, true, || false), |_, _| {})
+        printing::print(&meta.sizes, job, 0, |page, width, height, rotation| engine.render(&model::RenderKey { page, width, height, rotation, states: states.clone(), region: None }, true, || false), |_, _| {})
       }
     }
     Some("--ui-smoke") if args.len() == 3 => ui::run(pdfium_path(), Some(PathBuf::from(&args[1])), Some(PathBuf::from(&args[2])), None),

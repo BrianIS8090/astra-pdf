@@ -56,6 +56,61 @@ mod tests {
   use std::sync::Arc;
 
   #[test]
+  fn detailed_regions_match_full_page_at_every_rotation_and_layer_state() {
+    use crate::model::Region;
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let layers = Layers::read(&demo()).unwrap();
+    for states in [[true, true, true], [false, true, false]] {
+      let pdf = Pdf::open(api.clone(), Arc::new(layers.with_states(&states).unwrap())).unwrap();
+      for rotation in 0..4 {
+        let full = pdf.render(0, 1200, 1600, rotation, false).unwrap();
+        for (x, y) in [(0, 0), (410, 580), (900, 1300)] {
+          let r = Region {
+            x,
+            y,
+            width: 300,
+            height: 300,
+          };
+          let tile = pdf
+            .render_region(0, (1200, 1600), rotation, false, Some(r))
+            .unwrap();
+          let mut difference = 0;
+          for row in 0..r.height as usize {
+            let start = ((r.y as usize + row) * 1200 + r.x as usize) * 4;
+            difference += full.pixels[start..start + 1200]
+              .iter()
+              .zip(&tile.pixels[row * 1200..(row + 1) * 1200])
+              .filter(|(a, b)| a.abs_diff(**b) > 3)
+              .count();
+          }
+          assert!(
+            difference < 500,
+            "Участок не совпал с полной страницей: {rotation}, {x}, {y}, {difference}"
+          );
+        }
+      }
+      let tile = pdf
+        .render_region(
+          0,
+          (500_000, 700_000),
+          0,
+          false,
+          Some(Region {
+            x: 100_000,
+            y: 150_000,
+            width: 256,
+            height: 256,
+          }),
+        )
+        .unwrap();
+      assert_eq!(tile.pixels.len(), 256 * 256 * 4);
+      assert!(pdf
+        .render_region(0, (500_000, 700_000), 0, false, None)
+        .is_err());
+    }
+  }
+
+  #[test]
   fn reads_unicode_layers_and_never_changes_original() {
     let input = demo();
     let original = input.clone();

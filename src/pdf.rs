@@ -1,5 +1,6 @@
+use crate::model::Region;
 use libloading::Library;
-use std::{ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::VecDeque, ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};
 
 type Handle = *mut c_void;
 type Init = unsafe extern "C" fn();
@@ -74,6 +75,7 @@ pub struct Pdf {
   handle: Handle,
   _bytes: Arc<Vec<u8>>,
   pub sizes: Vec<(f64, f64)>,
+  pages: RefCell<VecDeque<(usize, Handle)>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +101,7 @@ impl Pdf {
         handle,
         _bytes: bytes,
         sizes: vec![],
+        pages: RefCell::new(VecDeque::new()),
       };
       let count = (pdf.api.count)(handle);
       if count <= 0 {
@@ -120,6 +123,7 @@ impl Pdf {
     }
   }
 
+  #[cfg(test)]
   pub fn render(
     &self,
     index: usize,
@@ -128,37 +132,70 @@ impl Pdf {
     rotation: i32,
     printing: bool,
   ) -> Result<Raster, String> {
+    self.render_region(index, (width, height), rotation, printing, None)
+  }
+
+  pub fn render_region(
+    &self,
+    index: usize,
+    size: (i32, i32),
+    rotation: i32,
+    printing: bool,
+    region: Option<Region>,
+  ) -> Result<Raster, String> {
+    let area = region.unwrap_or(Region {
+      x: 0,
+      y: 0,
+      width: size.0,
+      height: size.1,
+    });
+    let (width, height) = (area.width, area.height);
     if index >= self.sizes.len()
-      || width <= 0
-      || height <= 0
-      || i64::from(width) * i64::from(height) > 24_000_000
+      || size.0 <= 0
+      || size.1 <= 0
+      || size.0 > 1_000_000
+      || size.1 > 1_000_000
+      || !area.valid(size)
     {
       return Err("Размер страницы превышает предел отрисовки (24 млн пикселей).".into());
     }
     let mut pixels = vec![255u8; width as usize * height as usize * 4];
     unsafe {
-      let page = (self.api.page)(self.handle, index as i32);
+      // Повторные участки используют уже разобранную страницу; память удерживают только две страницы.
+      let mut pages = self.pages.borrow_mut();
+      let page = if let Some(pos) = pages.iter().position(|(i, _)| *i == index) {
+        let item = pages.remove(pos).unwrap();
+        pages.push_front(item);
+        item.1
+      } else {
+        if pages.len() >= 2 {
+          (self.api.close_page)(pages.pop_back().unwrap().1);
+        }
+        let handle = (self.api.page)(self.handle, index as i32);
+        if !handle.is_null() {
+          pages.push_front((index, handle));
+        }
+        handle
+      };
       if page.is_null() {
         return Err("Не удалось прочитать страницу.".into());
       }
       let bitmap = (self.api.bitmap)(width, height, 4, pixels.as_mut_ptr().cast(), width * 4);
       if bitmap.is_null() {
-        (self.api.close_page)(page);
         return Err("Не удалось выделить память для страницы.".into());
       }
       (self.api.fill)(bitmap, 0, 0, width, height, 0xffffffff);
       (self.api.render)(
         bitmap,
         page,
-        0,
-        0,
-        width,
-        height,
+        -area.x,
+        -area.y,
+        size.0,
+        size.1,
         rotation.rem_euclid(4),
-        1 | if printing { 0x800 } else { 0 },
+        1 | 0x200 | if printing { 0x800 } else { 0 },
       );
       (self.api.close_bitmap)(bitmap);
-      (self.api.close_page)(page);
     }
     Ok(Raster {
       width,
@@ -170,6 +207,9 @@ impl Pdf {
 
 impl Drop for Pdf {
   fn drop(&mut self) {
+    for (_, page) in self.pages.get_mut().drain(..) {
+      unsafe { (self.api.close_page)(page) };
+    }
     unsafe { (self.api.close)(self.handle) };
   }
 }

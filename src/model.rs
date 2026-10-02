@@ -15,6 +15,17 @@ pub fn render_size(
   dpi: f64,
   rotation: i32,
 ) -> (i32, i32, f64) {
+  page_size(page, viewport, zoom, dpi, rotation, None)
+}
+
+pub fn page_size(
+  page: (f64, f64),
+  viewport: (i32, i32),
+  zoom: Zoom,
+  dpi: f64,
+  rotation: i32,
+  detail_dimension: Option<i32>,
+) -> (i32, i32, f64) {
   let (w, h) = if rotation.rem_euclid(2) == 0 {
     page
   } else {
@@ -25,11 +36,15 @@ pub fn render_size(
   let scale = match zoom {
     Zoom::FitPage => (vw / w).min(vh / h),
     Zoom::FitWidth => vw / w,
-    Zoom::Scale(s) => s.clamp(0.1, 8.) * dpi / 72.,
+    Zoom::Scale(s) => s.clamp(0.1, if detail_dimension.is_some() { 64. } else { 8. }) * dpi / 72.,
   };
-  let scale = scale
-    .min((23_990_000. / (w * h)).sqrt())
-    .min(16_000. / w.max(h));
+  let scale = if let Some(limit) = detail_dimension {
+    scale.min(limit as f64 / w.max(h))
+  } else {
+    scale
+      .min((23_990_000. / (w * h)).sqrt())
+      .min(16_000. / w.max(h))
+  };
   (
     (w * scale).round().max(1.) as i32,
     (h * scale).round().max(1.) as i32,
@@ -44,6 +59,67 @@ pub struct RenderKey {
   pub height: i32,
   pub rotation: i32,
   pub states: Vec<bool>,
+  pub region: Option<Region>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+  pub x: i32,
+  pub y: i32,
+  pub width: i32,
+  pub height: i32,
+}
+
+impl Region {
+  pub fn valid(self, page: (i32, i32)) -> bool {
+    self.x >= 0
+      && self.y >= 0
+      && self.width > 0
+      && self.height > 0
+      && i64::from(self.x) + i64::from(self.width) <= i64::from(page.0)
+      && i64::from(self.y) + i64::from(self.height) <= i64::from(page.1)
+      && i64::from(self.width) * i64::from(self.height) <= 24_000_000
+  }
+}
+
+impl RenderKey {
+  pub fn raster_size(&self) -> (i32, i32) {
+    self
+      .region
+      .map_or((self.width, self.height), |r| (r.width, r.height))
+  }
+}
+
+pub fn visible_tiles(page: (i32, i32), visible: Region) -> Vec<Region> {
+  const TILE: i32 = 768;
+  let left = visible.x.max(0);
+  let top = visible.y.max(0);
+  let right = visible.x.saturating_add(visible.width).min(page.0);
+  let bottom = visible.y.saturating_add(visible.height).min(page.1);
+  if right <= left || bottom <= top {
+    return vec![];
+  }
+  let mut tiles = vec![];
+  for y in (top / TILE..=(bottom - 1) / TILE).take(16) {
+    for x in (left / TILE..=(right - 1) / TILE).take(16) {
+      // Два перекрывающихся пикселя сохраняют сглаживание на границах участков.
+      let px = (x * TILE - 2).max(0);
+      let py = (y * TILE - 2).max(0);
+      tiles.push(Region {
+        x: px,
+        y: py,
+        width: ((x + 1) * TILE + 2).min(page.0) - px,
+        height: ((y + 1) * TILE + 2).min(page.1) - py,
+      });
+    }
+  }
+  let center = (i64::from(left + right), i64::from(top + bottom));
+  tiles.sort_by_key(|r| {
+    let dx = i64::from(2 * r.x + r.width) - center.0;
+    let dy = i64::from(2 * r.y + r.height) - center.1;
+    dx * dx + dy * dy
+  });
+  tiles
 }
 
 pub struct Cache {
@@ -79,7 +155,13 @@ impl Cache {
     self
       .entries
       .iter()
-      .find(|(k, _)| k.page == key.page && k.rotation == key.rotation && k.states == key.states)
+      .find(|(k, _)| {
+        k.region.is_none()
+          && key.region.is_none()
+          && k.page == key.page
+          && k.rotation == key.rotation
+          && k.states == key.states
+      })
       .map(|(_, image)| image)
   }
   pub fn len(&self) -> usize {
@@ -125,6 +207,87 @@ mod tests {
   use std::sync::Arc;
 
   #[test]
+  fn large_drawing_zoom_is_independent_of_raster_budget() {
+    let (w, h, scale) = page_size(
+      (2384., 1684.),
+      (1600, 1200),
+      Zoom::Scale(32.),
+      192.,
+      0,
+      Some(1_000_000),
+    );
+    assert!((scale - 32.).abs() < 0.0001);
+    assert!(i64::from(w) * i64::from(h) > 20_000_000_000);
+    let tiles = visible_tiles(
+      (w, h),
+      Region {
+        x: w / 2,
+        y: h / 2,
+        width: 1600,
+        height: 1200,
+      },
+    );
+    assert!(tiles.len() <= 12);
+    assert!(tiles
+      .iter()
+      .all(|r| r.valid((w, h)) && r.width <= 772 && r.height <= 772));
+    assert!(
+      tiles
+        .iter()
+        .map(|r| i64::from(r.width) * i64::from(r.height) * 4)
+        .sum::<i64>()
+        < 32 * 1024 * 1024
+    );
+  }
+
+  #[test]
+  fn tiles_cover_viewport_edges_without_gaps_and_reuse_grid() {
+    for (x, y) in [(-40, -20), (760, 760), (1800, 1450)] {
+      let visible = Region {
+        x,
+        y,
+        width: 500,
+        height: 400,
+      };
+      let tiles = visible_tiles((2000, 1600), visible);
+      for py in y.max(0)..(y + 400).min(1600) {
+        for px in x.max(0)..(x + 500).min(2000) {
+          assert!(tiles
+            .iter()
+            .any(|r| px >= r.x && py >= r.y && px < r.x + r.width && py < r.y + r.height));
+        }
+      }
+    }
+    let a = visible_tiles(
+      (100_000, 100_000),
+      Region {
+        x: 2000,
+        y: 2000,
+        width: 600,
+        height: 600,
+      },
+    );
+    let b = visible_tiles(
+      (100_000, 100_000),
+      Region {
+        x: 2010,
+        y: 2010,
+        width: 600,
+        height: 600,
+      },
+    );
+    assert_eq!(a.len(), b.len());
+    assert!(a.iter().all(|r| b.contains(r)));
+    assert!(!Region {
+      x: i32::MAX,
+      y: 0,
+      width: 2,
+      height: 2
+    }
+    .valid((1000, 1000)));
+  }
+
+  #[test]
   fn fit_rotation_and_memory_limit() {
     let (w, h, _) = render_size((600., 800.), (1000, 800), Zoom::FitPage, 96., 0);
     assert_eq!((w, h), (570, 760));
@@ -143,6 +306,7 @@ mod tests {
       height: 2,
       rotation: 0,
       states: vec![],
+      region: None,
     };
     let img = Raster {
       width: 2,
@@ -166,6 +330,7 @@ mod tests {
       height: 4,
       rotation: 0,
       states: vec![true],
+      region: None,
     };
     let image = Raster {
       width: 3,

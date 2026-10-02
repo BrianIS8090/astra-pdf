@@ -1,6 +1,6 @@
 use crate::{
   layers::{Layer, Layers},
-  model::RenderKey,
+  model::{Region, RenderKey},
   pdf::{Api, Pdf, Raster},
 };
 use std::{
@@ -53,7 +53,7 @@ enum Reply {
 struct Packet(Vec<u8>);
 impl Packet {
   fn new(kind: u8) -> Self {
-    Self(vec![b'A', b'P', b'D', b'F', 1, kind])
+    Self(vec![b'A', b'P', b'D', b'F', 2, kind])
   }
   fn byte(&mut self, value: u8) {
     self.0.push(value);
@@ -83,7 +83,7 @@ struct Cursor<'a> {
 }
 impl<'a> Cursor<'a> {
   fn new(bytes: &'a [u8]) -> Result<(Self, u8), String> {
-    if bytes.len() < 6 || bytes[..5] != [b'A', b'P', b'D', b'F', 1] {
+    if bytes.len() < 6 || bytes[..5] != [b'A', b'P', b'D', b'F', 2] {
       return Err("Несовместимый протокол движка PDF.".into());
     }
     Ok((Self { bytes, offset: 6 }, bytes[5]))
@@ -191,6 +191,12 @@ impl Request {
         p.u32(key.height as u32);
         p.u32(key.rotation as u32);
         p.byte(*printing as u8);
+        p.byte(key.region.is_some() as u8);
+        if let Some(r) = key.region {
+          for value in [r.x, r.y, r.width, r.height] {
+            p.u32(value as u32);
+          }
+        }
         p.u32(key.states.len() as u32);
         for s in &key.states {
           p.byte(*s as u8);
@@ -213,16 +219,37 @@ impl Request {
       }
       2 => {
         let page = c.count(MAX_ITEMS)?;
-        let width = c.count(24_000_000)? as i32;
-        let height = c.count(24_000_000)? as i32;
+        let width = c.count(1_000_000)? as i32;
+        let height = c.count(1_000_000)? as i32;
         let rotation = c.count(3)? as i32;
         let printing = c.boolean()?;
+        let region = if c.boolean()? {
+          Some(Region {
+            x: c.count(1_000_000)? as i32,
+            y: c.count(1_000_000)? as i32,
+            width: c.count(1_000_000)? as i32,
+            height: c.count(1_000_000)? as i32,
+          })
+        } else {
+          None
+        };
         let count = c.count(MAX_ITEMS)?;
         let mut states = Vec::with_capacity(count);
         for _ in 0..count {
           states.push(c.boolean()?);
         }
-        if width == 0 || height == 0 || i64::from(width) * i64::from(height) > 24_000_000 {
+        if width == 0
+          || height == 0
+          || !region
+            .unwrap_or(Region {
+              x: 0,
+              y: 0,
+              width,
+              height,
+            })
+            .valid((width, height))
+          || (printing && region.is_some())
+        {
           return Err("Недопустимый размер страницы.".into());
         }
         Self::Render(
@@ -232,6 +259,7 @@ impl Request {
             height,
             rotation,
             states,
+            region,
           },
           printing,
         )
@@ -578,7 +606,7 @@ impl Client {
       REQUEST_TIMEOUT,
       cancelled,
     )? {
-      Reply::Image(image) if image.width == key.width && image.height == key.height => Ok(image),
+      Reply::Image(image) if (image.width, image.height) == key.raster_size() => Ok(image),
       _ => {
         self.stop();
         Err("Движок вернул неверный ответ отрисовки.".into())
@@ -694,13 +722,16 @@ pub fn serve(diagnostics: bool) -> Result<(), String> {
           }
         }
         Ok(Reply::Image(
-          current.as_ref().ok_or("Документ не открыт.")?.render(
-            key.page,
-            key.width,
-            key.height,
-            key.rotation,
-            printing,
-          )?,
+          current
+            .as_ref()
+            .ok_or("Документ не открыт.")?
+            .render_region(
+              key.page,
+              (key.width, key.height),
+              key.rotation,
+              printing,
+              key.region,
+            )?,
         ))
       }
       Request::Probe(mode) if diagnostics => {
@@ -740,8 +771,23 @@ pub fn self_test(path: &Path, report: &Path) -> Result<(), String> {
     height: 800,
     rotation: 0,
     states: meta.layers.iter().map(|l| l.visible).collect(),
+    region: None,
   };
   let image = client.render(&key, false, || false)?;
+  let mut tile_key = key.clone();
+  tile_key.region = Some(Region {
+    x: 130,
+    y: 190,
+    width: 180,
+    height: 210,
+  });
+  let tile = client.render(&tile_key, false, || false)?;
+  for row in 0..210 {
+    let start = ((190 + row) * 600 + 130) * 4;
+    if tile.pixels[row * 720..(row + 1) * 720] != image.pixels[start..start + 720] {
+      return Err("Участок через канал движка не совпал с полной страницей.".into());
+    }
+  }
   if image.pixels.iter().all(|v| *v == 255) {
     return Err("Тестовая страница оказалась пустой.".into());
   }
@@ -883,6 +929,52 @@ mod tests {
     }
   }
   #[test]
+  fn protocol_accepts_bounded_tiles_and_rejects_invalid_regions() {
+    let mut key = RenderKey {
+      page: 0,
+      width: 500_000,
+      height: 700_000,
+      rotation: 3,
+      states: vec![true, false],
+      region: Some(Region {
+        x: 499_000,
+        y: 699_000,
+        width: 768,
+        height: 768,
+      }),
+    };
+    match Request::decode(&Request::Render(key.clone(), false).encode()).unwrap() {
+      Request::Render(actual, false) => assert_eq!(actual, key),
+      _ => panic!("Неверный ответ"),
+    }
+    assert!(Request::decode(&Request::Render(key.clone(), true).encode()).is_err());
+    for region in [
+      None,
+      Some(Region {
+        x: 499_999,
+        y: 0,
+        width: 2,
+        height: 2,
+      }),
+      Some(Region {
+        x: -1,
+        y: 0,
+        width: 2,
+        height: 2,
+      }),
+      Some(Region {
+        x: 0,
+        y: 0,
+        width: 10000,
+        height: 10000,
+      }),
+    ] {
+      key.region = region;
+      assert!(Request::decode(&Request::Render(key.clone(), false).encode()).is_err());
+    }
+  }
+
+  #[test]
   fn protocol_rejects_nonfinite_sizes_and_bad_flags() {
     let mut p = Packet::new(1);
     p.0.extend_from_slice(&[0; 32]);
@@ -897,6 +989,7 @@ mod tests {
         height: 800,
         rotation: 0,
         states: vec![true],
+        region: None,
       },
       false,
     )

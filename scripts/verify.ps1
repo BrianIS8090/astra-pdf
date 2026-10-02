@@ -57,7 +57,9 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла независимая проверка печати' }
   & $Python "$PSScriptRoot\verify_ui.py" $exe "$outputDir\corpus" "$outputDir\ui" $demo @ExtraPdf 2>&1 | Tee-Object "$outputDir\ui.txt"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка интерфейса' }
-  foreach ($file in @('engine.json', 'window.png', 'window.ok.txt', 'window.print.pdf', 'printed.pdf', 'print-verification.json', 'ui\ui-verification.json')) {
+  & $Python "$PSScriptRoot\verify_detail.py" $exe "$outputDir\detail" @ExtraPdf 2>&1 | Tee-Object "$outputDir\detail.txt"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка детального просмотра' }
+  foreach ($file in @('engine.json', 'window.png', 'window.ok.txt', 'window.print.pdf', 'printed.pdf', 'print-verification.json', 'ui\ui-verification.json', 'detail\detail-verification.json')) {
     $result = Get-Item -LiteralPath (Join-Path $outputDir $file)
     if ($result.Length -eq 0 -or $result.LastWriteTimeUtc -lt $started.AddSeconds(-2)) { throw "Нет свежего результата: $file" }
   }

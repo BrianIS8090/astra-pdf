@@ -1,4 +1,4 @@
-use crate::model::{render_size, Zoom};
+use crate::model::{page_size, Zoom};
 use std::ops::Range;
 
 #[derive(Clone, Debug)]
@@ -25,8 +25,23 @@ impl DocumentLayout {
     dpi: u32,
     rotation: i32,
   ) -> Self {
+    Self::with_detail(sizes, viewport, zoom, dpi, rotation, false)
+  }
+
+  pub fn with_detail(
+    sizes: &[(f64, f64)],
+    viewport: (i32, i32),
+    zoom: Zoom,
+    dpi: u32,
+    rotation: i32,
+    detail: bool,
+  ) -> Self {
     let margin = (20. * dpi as f64 / 96.).round() as i32;
     let gap = (18. * dpi as f64 / 96.).round() as i32;
+    // Суммарная лента остаётся в диапазоне системной полосы прокрутки даже для 100 000 страниц.
+    let dimension =
+      ((i32::MAX as i64 - 4 * margin as i64) / sizes.len().max(1) as i64 - gap as i64 - 4)
+        .clamp(1, 1_000_000) as i32;
     let mut top = margin;
     let mut width = 0;
     let pages = sizes
@@ -34,7 +49,14 @@ impl DocumentLayout {
       .map(|&size| {
         // render_size резервирует 40 пикселей; здесь поля зависят от масштаба Windows.
         let view = (viewport.0 - 2 * margin + 40, viewport.1 - 2 * margin + 40);
-        let (w, h, scale) = render_size(size, view, zoom, dpi as f64, rotation);
+        let (w, h, scale) = page_size(
+          size,
+          view,
+          zoom,
+          dpi as f64,
+          rotation,
+          detail.then_some(dimension),
+        );
         let page = PageBox {
           top,
           width: w,
@@ -80,6 +102,27 @@ impl DocumentLayout {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn detailed_long_document_remains_scrollable_without_integer_overflow() {
+    let layout = DocumentLayout::with_detail(
+      &vec![(100_000., 100_000.); 100_000],
+      (1000, 800),
+      Zoom::Scale(64.),
+      192,
+      0,
+      true,
+    );
+    assert!(layout.height > 0 && layout.height < i32::MAX);
+    assert_eq!(
+      layout.visible(layout.pages[99_999].top, 800),
+      99_999..100_000
+    );
+    assert!(layout
+      .pages
+      .windows(2)
+      .all(|w| w[0].top + w[0].height < w[1].top));
+  }
 
   #[test]
   fn continuous_pages_share_viewport_at_boundary() {

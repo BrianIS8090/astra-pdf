@@ -1,7 +1,7 @@
 use crate::{
   layers::{Layer, Layers},
   layout::DocumentLayout,
-  model::{render_size, Cache, RenderKey, Zoom},
+  model::{render_size, visible_tiles, Cache, Region, RenderKey, Zoom},
   pdf::Raster,
   printing::{self, wide},
   worker::{Command, Event, Worker, READY},
@@ -43,8 +43,9 @@ const TAB_PAGES: usize = 24;
 const TAB_LAYERS: usize = 25;
 const LAYER_NOTE: usize = 26;
 const CONTINUOUS: usize = 27;
+const VIEW_MODE: usize = 28;
 
-type LayoutKey = (u64, i32, i32, Zoom, u32, i32);
+type LayoutKey = (u64, i32, i32, Zoom, u32, i32, bool);
 type ThumbContext = (u64, u32, i32, Vec<bool>);
 
 #[derive(Clone, Copy)]
@@ -99,6 +100,8 @@ struct App {
   document_layout: DocumentLayout,
   layout_key: Option<LayoutKey>,
   frames: Cache,
+  details: Cache,
+  detail_mode: bool,
   thumbnails: Cache,
   render_plan: Vec<RenderKey>,
   thumb_plan: Vec<RenderKey>,
@@ -197,6 +200,16 @@ impl App {
       (BS_AUTOCHECKBOX | BS_PUSHLIKE) as u32,
     );
     SendMessageW(continuous, BM_SETCHECK, BST_CHECKED as usize, 0);
+    let mode = self.create(
+      VIEW_MODE,
+      "COMBOBOX",
+      "Режим просмотра",
+      CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+    );
+    for label in ["Быстрый просмотр", "Чертёж — точные детали"] {
+      SendMessageW(mode, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+    }
+    SendMessageW(mode, CB_SETCURSEL, 0, 0);
     self.create(
       PAGE_EDIT,
       "EDIT",
@@ -354,15 +367,16 @@ impl App {
     }
     self.place(TAB_PAGES, 12, top + 13, 107, 32);
     self.place(TAB_LAYERS, 124, top + 13, 104, 32);
-    self.place(PAGE_LIST, 12, top + 60, 216, (height - top - 100).max(30));
+    self.place(VIEW_MODE, 12, top + 54, 216, 120);
+    self.place(PAGE_LIST, 12, top + 96, 216, (height - top - 136).max(30));
     SendMessageW(
       self.control(PAGE_LIST),
       LB_SETITEMHEIGHT,
       0,
       self.unit(184) as isize,
     );
-    self.place(LAYER_LIST, 12, top + 60, 216, (height - top - 150).max(30));
-    self.place(LAYER_NOTE, 20, top + 68, 200, 100);
+    self.place(LAYER_LIST, 12, top + 96, 216, (height - top - 186).max(30));
+    self.place(LAYER_NOTE, 20, top + 104, 200, 100);
     self.place(RESET, 12, height - 78, 216, 32);
     MoveWindow(
       self.canvas,
@@ -510,6 +524,7 @@ impl App {
     self.scroll = (0, 0);
     self.image = None;
     self.frames = Cache::with_count(96 * 1024 * 1024, 64);
+    self.details = Cache::with_count(64 * 1024 * 1024, 64);
     self.thumbnails = Cache::with_count(16 * 1024 * 1024, 48);
     self.document_layout = DocumentLayout::default();
     self.layout_key = None;
@@ -565,16 +580,57 @@ impl App {
   fn page_key(&self, page: usize) -> RenderKey {
     let p = &self.document_layout.pages[page];
     // Ограничение одного изображения оставляет память для соседних страниц.
-    let downscale = (8_000_000. / (p.width as f64 * p.height as f64))
-      .sqrt()
-      .min(1.);
+    let pixels = p.width as f64 * p.height as f64;
+    let budget = if self.detail_mode && pixels > 8_000_000. {
+      2_000_000.
+    } else {
+      8_000_000.
+    };
+    let downscale = (budget / pixels).sqrt().min(1.);
     RenderKey {
       page,
       width: (p.width as f64 * downscale).round().max(1.) as i32,
       height: (p.height as f64 * downscale).round().max(1.) as i32,
       rotation: self.rotation,
       states: self.states.clone(),
+      region: None,
     }
+  }
+
+  fn cached(&self, key: &RenderKey) -> Option<&Raster> {
+    if key.region.is_some() {
+      self.details.peek(key)
+    } else {
+      self.frames.peek(key)
+    }
+  }
+
+  unsafe fn detail_keys(&self, page: usize) -> Vec<RenderKey> {
+    let p = &self.document_layout.pages[page];
+    if !self.detail_mode || i64::from(p.width) * i64::from(p.height) <= 8_000_000 {
+      return vec![];
+    }
+    let origin = self.page_origin(page);
+    let view = self.viewport();
+    visible_tiles(
+      (p.width, p.height),
+      Region {
+        x: self.scroll.0 - origin.0,
+        y: self.scroll.1 - origin.1,
+        width: view.0,
+        height: view.1,
+      },
+    )
+    .into_iter()
+    .map(|region| RenderKey {
+      page,
+      width: p.width,
+      height: p.height,
+      rotation: self.rotation,
+      states: self.states.clone(),
+      region: Some(region),
+    })
+    .collect()
   }
 
   unsafe fn remember_anchor(&mut self, point: Option<(i32, i32)>) {
@@ -612,13 +668,17 @@ impl App {
       self.zoom,
       self.dpi,
       self.rotation,
+      self.detail_mode,
     );
     if self.layout_key != Some(key) {
       if self.anchor.is_none() && !self.document_layout.pages.is_empty() {
         self.remember_anchor(None);
       }
-      self.document_layout =
-        DocumentLayout::new(&self.sizes, view, self.zoom, self.dpi, self.rotation);
+      self.document_layout = if self.detail_mode {
+        DocumentLayout::with_detail(&self.sizes, view, self.zoom, self.dpi, self.rotation, true)
+      } else {
+        DocumentLayout::new(&self.sizes, view, self.zoom, self.dpi, self.rotation)
+      };
       self.layout_key = Some(key);
     }
     if let Some(anchor) = self.anchor.take().filter(|a| a.page < self.sizes.len()) {
@@ -672,17 +732,35 @@ impl App {
     }
     self.reflow();
     let current_key = self.page_key(self.page);
-    self.image = self.frames.peek(&current_key).cloned();
+    self.image = self
+      .frames
+      .peek(&current_key)
+      .or_else(|| {
+        self
+          .detail_mode
+          .then(|| self.frames.preview(&current_key))
+          .flatten()
+      })
+      .cloned();
     let mut pages = self.visible_pages();
     pages.sort_by_key(|p| p.abs_diff(self.page));
-    let plan: Vec<_> = pages.into_iter().map(|p| self.page_key(p)).collect();
-    self.rendering = plan.iter().any(|key| self.frames.peek(key).is_none());
+    let mut plan = vec![];
+    for page in pages {
+      let details = self.detail_keys(page);
+      let key = self.page_key(page);
+      // Готовый обзор уже сохраняет изображение: сначала уточняем видимые детали.
+      if details.is_empty() || self.frames.preview(&key).is_none() {
+        plan.push(key);
+      }
+      plan.extend(details);
+    }
+    self.rendering = plan.iter().any(|key| self.cached(key).is_none());
     if plan != self.render_plan {
       self.ticket += 1;
       self.worker.latest.store(self.ticket, Ordering::Relaxed);
       let missing = plan
         .iter()
-        .filter(|key| self.frames.peek(key).is_none())
+        .filter(|key| self.cached(key).is_none())
         .cloned()
         .collect();
       self.render_plan = plan;
@@ -716,6 +794,13 @@ impl App {
         "Одна страница"
       }
     );
+    if self.detail_mode {
+      self.status.push_str(if self.rendering {
+        "   ·   Уточняю детали…"
+      } else {
+        "   ·   Чертёж"
+      });
+    }
     if self.layer_warning {
       self.status.push_str("   ·   Слои недоступны");
     }
@@ -778,6 +863,7 @@ impl App {
       height,
       rotation: self.rotation,
       states: self.states.clone(),
+      region: None,
     }
   }
 
@@ -830,7 +916,8 @@ impl App {
 
   unsafe fn zoom_at(&mut self, factor: f64, point: Option<(i32, i32)>) {
     self.remember_anchor(point);
-    self.zoom = Zoom::Scale((self.scale * factor).clamp(0.1, 8.));
+    self.zoom =
+      Zoom::Scale((self.scale * factor).clamp(0.1, if self.detail_mode { 64. } else { 8. }));
     self.reflow();
     self.rendering = true;
     self.refresh_status();
@@ -884,6 +971,15 @@ impl App {
       NEXT => self.navigate(self.page + 1),
       MINUS => self.zoom_by(1. / 1.1),
       PLUS => self.zoom_by(1.1),
+      VIEW_MODE => {
+        self.remember_anchor(None);
+        self.detail_mode = SendMessageW(self.control(VIEW_MODE), CB_GETCURSEL, 0, 0) == 1;
+        if let Zoom::Scale(s) = self.zoom {
+          self.zoom = Zoom::Scale(s.min(if self.detail_mode { 64. } else { 8. }));
+        }
+        self.render_plan.clear();
+        self.request();
+      }
       FIT => {
         self.zoom = Zoom::FitPage;
         self.anchor = Some(ViewAnchor {
@@ -1007,12 +1103,26 @@ impl App {
           self
             .first_frame_ms
             .get_or_insert(self.opened_at.elapsed().as_millis());
-          self.frames.put(key, image);
-          self.image = self.frames.peek(&self.page_key(self.page)).cloned();
+          if key.region.is_some() {
+            self.details.put(key, image);
+          } else {
+            self.frames.put(key, image);
+          }
+          let current_key = self.page_key(self.page);
+          self.image = self
+            .frames
+            .peek(&current_key)
+            .or_else(|| {
+              self
+                .detail_mode
+                .then(|| self.frames.preview(&current_key))
+                .flatten()
+            })
+            .cloned();
           self.rendering = self
             .render_plan
             .iter()
-            .any(|key| self.frames.peek(key).is_none());
+            .any(|key| self.cached(key).is_none());
           self.refresh_status();
           InvalidateRect(self.canvas, ptr::null(), 0);
           if self.smoke.is_some() {
@@ -1163,6 +1273,19 @@ impl App {
             self.font,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
           );
+        }
+        for key in self.detail_keys(page) {
+          if let Some(image) = self.details.peek(&key) {
+            let region = key.region.unwrap();
+            printing::draw_raster(
+              mem,
+              image,
+              x + region.x,
+              y + region.y,
+              region.width,
+              region.height,
+            );
+          }
         }
       }
     } else {
@@ -1554,6 +1677,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
           a.visible_pages().iter().map(|&p| { let b = &a.document_layout.pages[p]; [p as i32, b.top, b.width, b.height] }).collect::<Vec<_>>(),
           !a.document_layout.pages.is_empty() && a.frames.preview(&a.page_key(a.page)).is_some()
         );
+        let tiles: Vec<_> = a
+          .visible_pages()
+          .into_iter()
+          .flat_map(|p| a.detail_keys(p))
+          .collect();
+        let report = format!("{},\"detail_mode\":{},\"tiles_visible\":{},\"tiles_ready\":{},\"tile_bytes\":{},\"viewport\":{:?}}}",
+          &report[..report.len()-1], a.detail_mode, tiles.len(), tiles.iter().filter(|k| a.details.peek(k).is_some()).count(), a.details.bytes, [a.viewport().0,a.viewport().1]);
         let _ = std::fs::write(path, report);
       }
     });
@@ -1707,7 +1837,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if index >= 0 {
           app.navigate(index as usize);
         }
-      } else if notification == BN_CLICKED {
+      } else if (id == VIEW_MODE && notification == CBN_SELCHANGE) || notification == BN_CLICKED {
         app.action(id);
       }
       Some(0)
@@ -2042,6 +2172,8 @@ pub fn run(
       frames: Cache::with_count(96 * 1024 * 1024, 64),
       thumbnails: Cache::with_count(16 * 1024 * 1024, 48),
       render_plan: vec![],
+      detail_mode: false,
+      details: Cache::with_count(64 * 1024 * 1024, 64),
       thumb_plan: vec![],
       thumb_context: None,
       thumb_ticket: 0,

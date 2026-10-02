@@ -373,6 +373,7 @@ impl Worker {
                     height,
                     rotation: rotate,
                     states: states.clone(),
+                    region: None,
                   };
                   engine.render(&key, true, || {
                     queue.stopped() || cancel.load(Ordering::Relaxed)
@@ -420,6 +421,7 @@ mod tests {
       height: 10,
       rotation: 0,
       states: vec![],
+      region: None,
     };
     sender
       .render_batch(1, 10, vec![key(0), key(1)], true)
@@ -485,6 +487,7 @@ mod tests {
             height: 1,
             rotation: 0,
             states: vec![],
+            region: None,
           },
         })
         .unwrap();

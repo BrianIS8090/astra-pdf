@@ -12,8 +12,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Astra PDF"
       VALUE "ProductName", "Astra PDF"
-      VALUE "FileVersion", "1.0.0-rc.2"
-      VALUE "ProductVersion", "1.0.0-rc.2"
+      VALUE "FileVersion", "1.0.0-rc.3"
+      VALUE "ProductVersion", "1.0.0-rc.3"
     END
   END
   BLOCK "VarFileInfo"
