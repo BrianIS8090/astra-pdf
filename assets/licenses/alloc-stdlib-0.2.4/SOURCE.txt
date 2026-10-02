@@ -1,0 +1,5 @@
+Лицензия пакета alloc-stdlib 0.2.4 отсутствует в опубликованном архиве crate.
+Она взята из корня того же репозитория и коммита, указанного в .cargo_vcs_info.json пакета.
+Источник: https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE
+Коммит: ae42d22078b98549e987d2f03d12df7b984fde47
+SHA256 LICENSE: C0C56F26D9C051CAC4D200C34C84E7AE9AAA853E01A982A1DF08B09931E518AE

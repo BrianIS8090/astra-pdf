@@ -1,0 +1,38 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Сборка и тесты Rust
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Установить закреплённые инструменты
+        run: .\scripts\setup.ps1
+      - name: Проверить форматирование и код
+        run: |
+          $env:CARGO_HOME = Join-Path $PWD 'tools\cargo'
+          $env:RUSTUP_HOME = Join-Path $PWD 'tools\rustup'
+          $env:PATH = "$PWD\tools\cargo\bin;$PWD\tools\w64devkit\bin;$env:PATH"
+          cargo fmt --all --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Выполнить тесты и собрать приложение
+        run: .\scripts\build.ps1 -Test -Release

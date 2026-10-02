@@ -1,0 +1,13 @@
+/target/
+/tools/
+/vendor/
+/dist/
+/test-output/
+*.log
+__pycache__/
+*.py[cod]
+.env
+.env.*
+*.pfx
+*.p12
+*.key
