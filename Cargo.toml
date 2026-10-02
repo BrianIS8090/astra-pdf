@@ -1,6 +1,6 @@
 [package]
 name = "astra-pdf"
-version = "1.0.0-rc.8"
+version = "1.0.0-rc.9"
 edition = "2021"
 description = "Нативный просмотрщик PDF для Windows"
 license = "MIT"
@@ -15,7 +15,6 @@ serde_json = "1.0"
 chacha20poly1305 = "0.10.1"
 zeroize = "1.8"
 flate2 = "1.1"
-skrifa = { version = "0.47", default-features = false, features = ["std"] }
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
   "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading",

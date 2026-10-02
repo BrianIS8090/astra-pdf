@@ -33,7 +33,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
       Operation::Text {
         page: 0,
         object: selected.index,
-        text: "Проверка текста 123".into(),
+        text: "Edited text 123".into(),
       },
       || false,
     )?,

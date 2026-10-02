@@ -1,16 +1,6 @@
 use super::*;
 use crate::editing::{Operation, PageObject};
-use skrifa::MetadataProvider;
 
-#[repr(C)]
-struct Matrix {
-  a: f32,
-  b: f32,
-  c: f32,
-  d: f32,
-  e: f32,
-  f: f32,
-}
 #[repr(C)]
 struct Output {
   version: i32,
@@ -30,9 +20,31 @@ unsafe extern "C" fn write(out: *mut Output, data: *const c_void, size: u32) -> 
   1
 }
 
+pub(super) fn save_document(pdf: &Pdf) -> Result<Vec<u8>, String> {
+  let mut output = Output {
+    version: 1,
+    write,
+    bytes: Vec::new(),
+  };
+  unsafe {
+    let save = *pdf
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle, *mut Output, u32) -> i32>(b"FPDF_SaveAsCopy\0")
+      .map_err(|e| e.to_string())?;
+    if save(pdf.handle, &mut output, 2 | 8) == 0 {
+      return Err("Не удалось сохранить PDF (предел копии 96 МБ).".into());
+    }
+  }
+  Ok(output.bytes)
+}
+
 impl Pdf {
   pub fn edit(&self, operation: &Operation) -> Result<Vec<u8>, String> {
-    if let Operation::Text { page, .. } | Operation::Delete { page, .. } = operation {
+    if let Operation::Text { page, object, text } = operation {
+      return self.replace_text(*page, *object, text);
+    }
+    if let Operation::Delete { page, .. } = operation {
       let bytes = crate::editing::separate_streams(&self._bytes, *page)?;
       let prepared = Pdf::open(self.api.clone(), Arc::new(bytes))?;
       return crate::editing::retain_state_fonts(
@@ -82,9 +94,18 @@ impl Pdf {
       );
       let load_text = sym!("FPDFText_LoadPage", unsafe extern "C" fn(Handle) -> Handle);
       let close_text = sym!("FPDFText_ClosePage", Close);
-      let text = sym!(
-        "FPDFTextObj_GetText",
-        unsafe extern "C" fn(Handle, Handle, *mut u16, u32) -> u32
+      let char_count = sym!("FPDFText_CountChars", unsafe extern "C" fn(Handle) -> i32);
+      let char_object = sym!(
+        "FPDFText_GetTextObject",
+        unsafe extern "C" fn(Handle, i32) -> Handle
+      );
+      let generated = sym!(
+        "FPDFText_IsGenerated",
+        unsafe extern "C" fn(Handle, i32) -> i32
+      );
+      let unicode = sym!(
+        "FPDFText_GetUnicode",
+        unsafe extern "C" fn(Handle, i32) -> u32
       );
       let remove = sym!(
         "FPDFPage_RemoveObject",
@@ -94,10 +115,6 @@ impl Pdf {
       let generate = sym!(
         "FPDFPage_GenerateContent",
         unsafe extern "C" fn(Handle) -> i32
-      );
-      let save = sym!(
-        "FPDF_SaveAsCopy",
-        unsafe extern "C" fn(Handle, *mut Output, u32) -> i32
       );
       let page = (self.api.page)(self.handle, index as i32);
       if page.is_null() {
@@ -112,6 +129,22 @@ impl Pdf {
           let text_page = load_text(page);
           if text_page.is_null() {
             return Err("Не удалось прочитать объекты страницы.".into());
+          }
+          let chars = char_count(text_page);
+          if !(0..=1_000_000).contains(&chars) {
+            close_text(text_page);
+            return Err("Слишком много символов на странице.".into());
+          }
+          let mut texts = std::collections::HashMap::<usize, String>::new();
+          for i in 0..chars {
+            if generated(text_page, i) == 0 {
+              if let Some(c) = char::from_u32(unicode(text_page, i)) {
+                let value = texts.entry(char_object(text_page, i) as usize).or_default();
+                if value.len() < 32_768 {
+                  value.push(c);
+                }
+              }
+            }
           }
           let mut objects = Vec::new();
           for i in 0..n {
@@ -131,16 +164,7 @@ impl Pdf {
               continue;
             }
             let object_kind = kind(object);
-            let mut value = String::new();
-            if object_kind == 1 {
-              let bytes = text(object, text_page, ptr::null_mut(), 0);
-              if bytes > 0 && bytes <= 32768 && bytes % 2 == 0 {
-                let mut buffer = vec![0u16; bytes as usize / 2];
-                if text(object, text_page, buffer.as_mut_ptr(), bytes) == bytes {
-                  value = String::from_utf16_lossy(&buffer[..buffer.len() - 1]);
-                }
-              }
-            }
+            let value = texts.remove(&(object as usize)).unwrap_or_default();
             objects.push(PageObject {
               index: i as usize,
               kind: object_kind,
@@ -174,147 +198,14 @@ impl Pdf {
               .into(),
           );
         }
-        if let Operation::Text { text, .. } = operation {
-          if kind(object) != 1
-            || text.is_empty()
-            || text.len() > 16_384
-            || text.chars().any(char::is_control)
-          {
-            return Err(
-              "Выберите отдельный текстовый объект и введите одну непустую строку.".into(),
-            );
-          }
-          let marks = sym!(
-            "FPDFPageObj_CountMarks",
-            unsafe extern "C" fn(Handle) -> i32
-          );
-          if marks(object) != 0 {
-            return Err("Текст находится в слое или размеченной группе. Замена такого текста пока отключена, чтобы сохранить структуру PDF.".into());
-          }
-          let clip = sym!(
-            "FPDFPageObj_GetClipPath",
-            unsafe extern "C" fn(Handle) -> Handle
-          );
-          let clip_count = sym!(
-            "FPDFClipPath_CountPaths",
-            unsafe extern "C" fn(Handle) -> i32
-          );
-          let clip_path = clip(object);
-          if !clip_path.is_null() && clip_count(clip_path) > 0 {
-            return Err(
-              "Текст ограничен обтравочным контуром. Замена пока не поддерживается.".into(),
-            );
-          }
-          let get_size = sym!(
-            "FPDFTextObj_GetFontSize",
-            unsafe extern "C" fn(Handle, *mut f32) -> i32
-          );
-          let get_matrix = sym!(
-            "FPDFPageObj_GetMatrix",
-            unsafe extern "C" fn(Handle, *mut Matrix) -> i32
-          );
-          let set_matrix = sym!(
-            "FPDFPageObj_SetMatrix",
-            unsafe extern "C" fn(Handle, *const Matrix) -> i32
-          );
-          let get_color = sym!(
-            "FPDFPageObj_GetFillColor",
-            unsafe extern "C" fn(Handle, *mut u32, *mut u32, *mut u32, *mut u32) -> i32
-          );
-          let set_color = sym!(
-            "FPDFPageObj_SetFillColor",
-            unsafe extern "C" fn(Handle, u32, u32, u32, u32) -> i32
-          );
-          let load_font = sym!(
-            "FPDFText_LoadFont",
-            unsafe extern "C" fn(Handle, *const u8, u32, i32, i32) -> Handle
-          );
-          let close_font = sym!("FPDFFont_Close", Close);
-          let new_text = sym!(
-            "FPDFPageObj_CreateTextObj",
-            unsafe extern "C" fn(Handle, Handle, f32) -> Handle
-          );
-          let set_text = sym!(
-            "FPDFText_SetText",
-            unsafe extern "C" fn(Handle, *const u16) -> i32
-          );
-          let insert = sym!(
-            "FPDFPage_InsertObjectAtIndex",
-            unsafe extern "C" fn(Handle, Handle, usize) -> i32
-          );
-          if mode(object) != 0 {
-            return Err(
-              "Этот текст использует контур или обтравку. Его замена пока не поддерживается."
-                .into(),
-            );
-          }
-          let mut matrix: Matrix = std::mem::zeroed();
-          let mut size = 0.;
-          let (mut r, mut g, mut b, mut a) = (0, 0, 0, 255);
-          if get_size(object, &mut size) == 0
-            || get_matrix(object, &mut matrix) == 0
-            || get_color(object, &mut r, &mut g, &mut b, &mut a) == 0
-          {
-            return Err("Не удалось прочитать оформление текста.".into());
-          }
-          let font_path = std::path::PathBuf::from(
-            std::env::var_os("WINDIR").ok_or("Не найден каталог Windows.")?,
-          )
-          .join("Fonts/arial.ttf");
-          let bytes = crate::export::read(&font_path, 16 * 1024 * 1024)?;
-          let face =
-            skrifa::FontRef::new(&bytes).map_err(|_| "Не удалось прочитать шрифт Arial.")?;
-          if text.chars().any(|c| face.charmap().map(c).is_none()) {
-            return Err("В Arial нет части введённых символов. Замена отменена.".into());
-          }
-          let font = load_font(self.handle, bytes.as_ptr(), bytes.len() as u32, 2, 1);
-          if font.is_null() {
-            return Err("Не удалось встроить шрифт Arial.".into());
-          }
-          let replacement = new_text(self.handle, font, size);
-          if replacement.is_null() {
-            close_font(font);
-            return Err("Не удалось создать текст.".into());
-          }
-          let utf16: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-          let ok = set_text(replacement, utf16.as_ptr()) != 0
-            && set_matrix(replacement, &matrix) != 0
-            && set_color(replacement, r, g, b, a) != 0;
-          if !ok {
-            destroy(replacement);
-            close_font(font);
-            return Err("Замена текста не удалась.".into());
-          }
-          // Вставка наследует поток соседа. Пока исходный объект на месте,
-          // замена попадает в его поток и сохраняет порядок и окружение.
-          if insert(page, replacement, object_index) == 0 {
-            close_font(font);
-            return Err("Не удалось вставить новый текст.".into());
-          }
-          if remove(page, object) == 0 {
-            close_font(font);
-            return Err("Не удалось заменить исходный текст.".into());
-          }
-          destroy(object);
-          close_font(font);
-        } else {
-          if remove(page, object) == 0 {
-            return Err("Не удалось удалить объект.".into());
-          }
-          destroy(object);
+        if remove(page, object) == 0 {
+          return Err("Не удалось удалить объект.".into());
         }
+        destroy(object);
         if generate(page) == 0 {
           return Err("Не удалось обновить содержимое страницы.".into());
         }
-        let mut output = Output {
-          version: 1,
-          write,
-          bytes: Vec::new(),
-        };
-        if save(self.handle, &mut output, 2 | 8) == 0 {
-          return Err("Не удалось сохранить PDF (предел копии 96 МБ).".into());
-        }
-        Ok(output.bytes)
+        save_document(self)
       })();
       (self.api.close_page)(page);
       result
@@ -338,6 +229,135 @@ mod tests {
     let mut result = Vec::new();
     doc.save_to(&mut result).unwrap();
     result
+  }
+
+  #[test]
+  fn text_edit_preserves_font_style_spacing_transform_and_neighbors() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    for font in ["Helvetica-Bold", "Times-Italic", "Courier-BoldOblique"] {
+      for show in [
+        "(OLD WORD) Tj",
+        "[(OL) 75 (D WO) -20 (RD)] TJ",
+        "(OLD WORD) '",
+        "4 2 (OLD WORD) \"",
+      ] {
+        let prefix = "q 0.8 0.2 0.1 rg 0.1 0.3 0.8 RG 0.5 w 0.98 0.1 -0.1 0.98 15 10 cm BT /F1 18 Tf 2 Tc 4 Tw 85 Tz 5 Ts 2 Tr 22 TL 40 600 Td";
+        let suffix = "0 Tc 0 Tw (KEEP) Tj ET Q BT /F1 12 Tf 40 300 Td (UNCHANGED) Tj ET";
+        let source = with_content(format!("{prefix} {show} {suffix}").as_bytes());
+        let mut doc = lopdf::Document::load_mem(&source).unwrap();
+        for obj in doc.objects.values_mut() {
+          if let Ok(d) = obj.as_dict_mut() {
+            if d.get(b"Type").and_then(lopdf::Object::as_name).ok() == Some(b"Font".as_slice()) {
+              d.set("BaseFont", lopdf::Object::Name(font.as_bytes().to_vec()));
+            }
+          }
+        }
+        let mut source = Vec::new();
+        doc.save_to(&mut source).unwrap();
+        let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+        let before: Vec<PageObject> =
+          serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+        let bytes = pdf
+          .edit(&Operation::Text {
+            page: 0,
+            object: 0,
+            text: "OLD WIDER WORD".into(),
+          })
+          .unwrap();
+        let after = Pdf::open(api.clone(), Arc::new(bytes.clone())).unwrap();
+        let list: Vec<PageObject> =
+          serde_json::from_slice(&after.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+        assert_eq!(list.len(), before.len());
+        for (a, b) in list.iter().skip(1).zip(before.iter().skip(1)) {
+          assert_eq!(a.text, b.text);
+          for (x, y) in a.bounds.iter().zip(b.bounds) {
+            assert!((x - y).abs() < 0.000005, "Смещён сосед: {font} / {show}");
+          }
+        }
+        let updated = lopdf::Document::load_mem(&bytes).unwrap();
+        let fonts = updated.get_page_fonts(updated.get_pages()[&1]).unwrap();
+        assert_eq!(fonts.len(), 1);
+        assert_eq!(
+          fonts
+            .values()
+            .next()
+            .unwrap()
+            .get(b"BaseFont")
+            .unwrap()
+            .as_name()
+            .unwrap(),
+          font.as_bytes()
+        );
+        let old_image = pdf.render(0, 1200, 1600, 0, false).unwrap();
+        let new_image = after.render(0, 1200, 1600, 0, false).unwrap();
+        assert_eq!(
+          &old_image.pixels[1200 * 800 * 4..],
+          &new_image.pixels[1200 * 800 * 4..]
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn editing_text_with_repeated_spaces_keeps_neighbor_position() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(crate::fixture::demo())).unwrap();
+    let bytes = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: 1,
+        text: "Edited text 123".into(),
+      })
+      .unwrap();
+    let after = Pdf::open(api, Arc::new(bytes)).unwrap();
+    let list: Vec<PageObject> =
+      serde_json::from_slice(&after.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(list[1].text, "Edited text 123");
+  }
+
+  #[test]
+  fn text_edit_rejects_missing_glyph_without_changing_original() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let source = with_content(b"BT /F1 18 Tf 40 700 Td (ORIGINAL) Tj ET");
+    let pdf = Pdf::open(api, Arc::new(source.clone())).unwrap();
+    assert!(pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: 0,
+        text: "Кириллица".into()
+      })
+      .unwrap_err()
+      .contains("исходном шрифте"));
+    assert_eq!(pdf.source_bytes().as_slice(), source);
+    let list: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(list[0].text, "ORIGINAL");
+  }
+
+  #[test]
+  fn editing_one_repeated_line_does_not_change_other_occurrences() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(
+      api.clone(),
+      Arc::new(with_content(
+        b"BT /F1 18 Tf 40 700 Td (OLD) Tj 0 -40 Td (OLD) Tj 0 -40 Td (OLD) Tj ET",
+      )),
+    )
+    .unwrap();
+    let bytes = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: 1,
+        text: "NEW".into(),
+      })
+      .unwrap();
+    let after = Pdf::open(api, Arc::new(bytes)).unwrap();
+    let list: Vec<PageObject> =
+      serde_json::from_slice(&after.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(
+      list.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(),
+      ["OLD", "NEW", "OLD"]
+    );
   }
 
   #[test]
@@ -594,8 +614,9 @@ mod tests {
 
   #[test]
   fn object_removal_and_cyrillic_text_survive_reopen() {
+    let fixture = super::super::text::font_fixture("arialbd.ttf", "Проверка исходного текста 123");
     let api = Api::new(&crate::pdfium_path()).unwrap();
-    let pdf = Pdf::open(api.clone(), Arc::new(crate::fixture::demo())).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(fixture)).unwrap();
     let objects: Vec<PageObject> =
       serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
     let text = objects

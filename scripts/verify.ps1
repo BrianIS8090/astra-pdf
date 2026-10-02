@@ -1,4 +1,4 @@
-﻿param([string]$Python = 'python', [string[]]$ExtraPdf = @())
+param([string]$Python = 'python', [string[]]$ExtraPdf = @())
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runId = 'verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -57,6 +57,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка инструментов и отмены' }
   & $Python "$PSScriptRoot\verify_session_ui.py" $exe "$outputDir\editing\source.pdf" "$outputDir\session-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сеанса редактирования и сохранения' }
+  & $Python "$PSScriptRoot\verify_fonts_ui.py" $exe "$outputDir\fonts-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сохранения шрифтов и оформления' }
   & $Python "$PSScriptRoot\verify_zoom_return.py" $exe "$outputDir\zoom-return"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка возврата масштаба с видимыми соседними страницами' }
   $env:ASTRA_SMOKE_PRINT = '1'

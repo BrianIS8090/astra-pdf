@@ -15,7 +15,7 @@ def verify(exe, output):
   assert [p.extract_text() for p in pages.pages] == [source.pages[i].extract_text() for i in (0, 2)]
   assert len(pages.trailer['/Root']['/OCProperties']['/OCGs']) == 3
   edited = PdfReader(output / 'edited.pdf', strict=True)
-  assert 'Проверка текста 123' in edited.pages[0].extract_text().replace('\xa0', ' ')
+  assert 'Edited text 123' in edited.pages[0].extract_text().replace('\xa0', ' ')
   objects = json.loads((output / 'objects.json').read_text(encoding='utf-8'))
   selected = next(o for o in objects if o['kind'] == 1 and o['text'])
   deleted = PdfReader(output / 'deleted.pdf', strict=True)
@@ -54,7 +54,7 @@ def verify(exe, output):
   encrypted = (output / 'fixture.astravault').read_bytes()
   assert original not in encrypted
   assert (output / 'fixture.astrakey').stat().st_size == 40
-  result = {'passed': True, 'checks': ['page_content_and_order', 'layers_retained', 'cyrillic_text_reopened', 'object_deleted', 'clean_pdf_image_only', 'no_original_metadata_or_attachments', 'page_dimensions', 'exact_original_restored', 'content_pixelation_matches_preview_grid'], 'image_tiles': image_count, 'source_sha256': hashlib.sha256(original).hexdigest()}
+  result = {'passed': True, 'checks': ['page_content_and_order', 'layers_retained', 'same_font_text_reopened', 'object_deleted', 'clean_pdf_image_only', 'no_original_metadata_or_attachments', 'page_dimensions', 'exact_original_restored', 'content_pixelation_matches_preview_grid'], 'image_tiles': image_count, 'source_sha256': hashlib.sha256(original).hexdigest()}
   (output / 'independent-verification.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
   print(json.dumps(result, ensure_ascii=True))
 
