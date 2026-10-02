@@ -50,6 +50,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
   )?;
   let bounds = selected.bounds;
   let masks = vec![Mask {
+    kind: crate::editing::MaskKind::Cover,
     page: 0,
     bounds: [
       (bounds[0] - 0.01).max(0.),
@@ -65,6 +66,28 @@ pub fn run(directory: &Path) -> Result<(), String> {
     &states,
     &masks,
     &directory.join("clean.pdf"),
+    || false,
+    |_, _| {},
+  )?;
+  let pixel_key = crate::pixelate::key(0, meta.sizes[0], 6, &states)?;
+  let grid = crate::pixelate::render_grid(|key| client.render(key, false, || false), &pixel_key)?;
+  export::write(
+    &directory.join("pixel-grid.json"),
+    &serde_json::to_vec(
+      &serde_json::json!({"width":grid.width,"height":grid.height,"bgra":*grid.pixels}),
+    )
+    .map_err(|e| e.to_string())?,
+  )?;
+  export::clean_pdf(
+    |key| client.render(key, false, || false),
+    &meta.sizes,
+    &states,
+    &[Mask {
+      page: 0,
+      bounds: [0., 0., 1., 1.],
+      kind: crate::editing::MaskKind::Pixelate { block_mm: 6 },
+    }],
+    &directory.join("pixelated.pdf"),
     || false,
     |_, _| {},
   )?;

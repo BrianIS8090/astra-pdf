@@ -33,6 +33,10 @@ pub enum Command {
     ticket: u64,
     key: RenderKey,
   },
+  Mosaic {
+    generation: u64,
+    key: RenderKey,
+  },
   Print {
     generation: u64,
     states: Vec<bool>,
@@ -42,6 +46,11 @@ pub enum Command {
   Quit,
 }
 pub enum Event {
+  Mosaic {
+    generation: u64,
+    key: RenderKey,
+    result: Result<Raster, String>,
+  },
   Loaded {
     fingerprint: [u8; 32],
     generation: u64,
@@ -82,6 +91,7 @@ struct Pending {
   open: Option<Command>,
   render: VecDeque<Command>,
   thumbnails: VecDeque<Command>,
+  mosaics: VecDeque<Command>,
   print: Option<Command>,
   closed: bool,
 }
@@ -93,6 +103,19 @@ struct Queue {
 
 pub struct CommandSender(Arc<Queue>);
 impl CommandSender {
+  pub fn mosaic_batch(&self, generation: u64, keys: Vec<RenderKey>) -> Result<(), ()> {
+    let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.closed {
+      return Err(());
+    }
+    pending.mosaics = keys
+      .into_iter()
+      .take(128)
+      .map(|key| Command::Mosaic { generation, key })
+      .collect();
+    self.0.changed.notify_one();
+    Ok(())
+  }
   pub fn render_batch(
     &self,
     generation: u64,
@@ -139,6 +162,7 @@ impl CommandSender {
         pending.open = Some(command);
         pending.render.clear();
         pending.thumbnails.clear();
+        pending.mosaics.clear();
       }
       Command::Render { .. } => {
         pending.render.clear();
@@ -147,6 +171,10 @@ impl CommandSender {
       Command::Thumbnail { .. } => {
         pending.thumbnails.clear();
         pending.thumbnails.push_back(command);
+      }
+      Command::Mosaic { .. } => {
+        pending.mosaics.clear();
+        pending.mosaics.push_back(command);
       }
       Command::Print { .. } => {
         if pending.print.is_some() {
@@ -160,6 +188,7 @@ impl CommandSender {
         pending.render.clear();
         pending.thumbnails.clear();
         pending.print = None;
+        pending.mosaics.clear();
       }
     }
     self.0.changed.notify_one();
@@ -178,6 +207,7 @@ impl Queue {
         .take()
         .or_else(|| pending.open.take())
         .or_else(|| pending.render.pop_front())
+        .or_else(|| pending.mosaics.pop_front())
         .or_else(|| pending.thumbnails.pop_front())
       {
         return Some(command);
@@ -350,6 +380,34 @@ impl Worker {
               });
             }
           }
+          Command::Mosaic {
+            generation: id,
+            key,
+          } => {
+            if id != generation {
+              continue;
+            }
+            let result = client
+              .as_mut()
+              .ok_or_else(|| "Документ не открыт.".to_string())
+              .and_then(|engine| {
+                crate::pixelate::render_grid(
+                  |sample| {
+                    engine.render(sample, false, || {
+                      queue.stopped() || queue.generation.load(Ordering::Relaxed) != id
+                    })
+                  },
+                  &key,
+                )
+              });
+            if !queue.stopped() && id == queue.generation.load(Ordering::Relaxed) {
+              send(Event::Mosaic {
+                generation: id,
+                key,
+                result,
+              });
+            }
+          }
           Command::Print {
             generation: id,
             states,
@@ -434,6 +492,8 @@ mod tests {
     sender
       .render_batch(1, 21, vec![key(5), key(6)], false)
       .unwrap();
+    sender.mosaic_batch(1, vec![key(8)]).unwrap();
+    sender.mosaic_batch(1, vec![key(9)]).unwrap();
     assert!(matches!(
       queue.next(),
       Some(Command::Render {
@@ -452,8 +512,16 @@ mod tests {
     ));
     assert!(matches!(
       queue.next(),
+      Some(Command::Mosaic {
+        key: RenderKey { page: 9, .. },
+        ..
+      })
+    ));
+    assert!(matches!(
+      queue.next(),
       Some(Command::Thumbnail { ticket: 10, .. })
     ));
+    sender.mosaic_batch(1, vec![key(10)]).unwrap();
     sender
       .send(Command::Open {
         generation: 2,
@@ -461,6 +529,7 @@ mod tests {
       })
       .unwrap();
     assert!(queue.pending.lock().unwrap().thumbnails.is_empty());
+    assert!(queue.pending.lock().unwrap().mosaics.is_empty());
     sender.send(Command::Quit).unwrap();
   }
 

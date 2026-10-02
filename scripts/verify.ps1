@@ -51,6 +51,8 @@ try {
   Invoke-Viewer @('--engine-selftest', (Quoted $demo), (Quoted "$outputDir\engine.json"))
   & $Python "$PSScriptRoot\verify_editing.py" $exe "$outputDir\editing"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла независимая проверка редактирования и очистки PDF' }
+  & $Python "$PSScriptRoot\verify_pixel_ui.py" $exe "$outputDir\editing" "$outputDir\pixel-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка пикселизации в окне' }
   $env:ASTRA_SMOKE_PRINT = '1'
   Invoke-Viewer @('--ui-smoke', (Quoted $demo), (Quoted "$outputDir\window.png"))
   $env:ASTRA_SMOKE_PRINT = $null

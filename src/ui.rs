@@ -504,7 +504,7 @@ impl App {
   }
 
   unsafe fn open(&mut self, path: PathBuf) {
-    self.editor = editor::Editor::default();
+    self.editor.reset();
     self.opened_at = std::time::Instant::now();
     self.first_frame_ms = None;
     self.last_error = false;
@@ -780,6 +780,7 @@ impl App {
     self.sync_page_controls();
     self.refresh_status();
     self.request_thumbnails();
+    self.request_mosaics();
     InvalidateRect(self.canvas, ptr::null(), 0);
   }
 
@@ -970,7 +971,7 @@ impl App {
     if self.editor.busy && id != CANCEL {
       return;
     }
-    if (editor::PAGES..=51).contains(&id) {
+    if (editor::PAGES..=editor::PIXEL_LARGE).contains(&id) {
       PostMessageW(self.hwnd, WM_APP + 21, id, 0);
       return;
     }
@@ -1037,6 +1038,7 @@ impl App {
         self.layer_tab = id == TAB_LAYERS;
         self.layout();
         self.request_thumbnails();
+        self.request_mosaics();
       }
       RESET if !self.printing => {
         self.states = self.layers.iter().map(|l| l.visible).collect();
@@ -1073,6 +1075,26 @@ impl App {
   unsafe fn events(&mut self) {
     while let Ok(event) = self.worker.receiver.try_recv() {
       match event {
+        Event::Mosaic {
+          generation,
+          key,
+          result,
+        } if generation == self.generation => {
+          match result {
+            Ok(image) => {
+              self
+                .editor
+                .grids
+                .get_or_insert_with(|| Cache::with_count(16 * 1024 * 1024, 32))
+                .put(key, image);
+            }
+            Err(message) => {
+              self.editor.notice = Some(format!("Предпросмотр пикселизации: {message}"));
+              PostMessageW(self.hwnd, WM_APP + 23, 0, 0);
+            }
+          }
+          InvalidateRect(self.canvas, ptr::null(), 0);
+        }
         Event::Loaded {
           fingerprint,
           generation,
@@ -1759,7 +1781,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
           .collect();
         let report = format!("{},\"detail_mode\":{},\"tiles_visible\":{},\"tiles_ready\":{},\"tile_bytes\":{},\"viewport\":{:?}}}",
           &report[..report.len()-1], a.detail_mode, tiles.len(), tiles.iter().filter(|k| a.details.peek(k).is_some()).count(), a.details.bytes, [a.viewport().0,a.viewport().1]);
-        let _ = std::fs::write(path, report);
+        let mut report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        report["editor"] = a.editor.probe();
+        report["page_origins"] = serde_json::json!(a
+          .visible_pages()
+          .iter()
+          .map(|&p| {
+            let o = a.page_origin(p);
+            [p as i32, o.0 - a.scroll.0, o.1 - a.scroll.1]
+          })
+          .collect::<Vec<_>>());
+        let _ = std::fs::write(path, report.to_string());
       }
     });
     return 0;

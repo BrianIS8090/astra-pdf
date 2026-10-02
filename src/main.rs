@@ -10,6 +10,7 @@ mod layers;
 mod layout;
 mod model;
 mod pdf;
+mod pixelate;
 mod print_pipeline;
 mod printing;
 mod ui;

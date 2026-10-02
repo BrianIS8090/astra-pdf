@@ -32,11 +32,26 @@ pub struct PageObject {
 pub struct Mask {
   pub page: usize,
   pub bounds: [f64; 4],
+  #[serde(default)]
+  pub kind: MaskKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaskKind {
+  #[default]
+  Cover,
+  Pixelate {
+    block_mm: u8,
+  },
 }
 
 impl Mask {
   pub fn valid(&self, pages: usize) -> bool {
     self.page < pages
+      && match self.kind {
+        MaskKind::Cover => true,
+        MaskKind::Pixelate { block_mm } => [3, 6, 12].contains(&block_mm),
+      }
       && self
         .bounds
         .iter()

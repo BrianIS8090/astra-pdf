@@ -1,5 +1,5 @@
 use crate::{
-  editing::Mask,
+  editing::{Mask, MaskKind},
   model::{Region, RenderKey},
   vault,
 };
@@ -111,7 +111,10 @@ pub fn mask_pixels(
   masks: &[Mask],
   page: usize,
 ) {
-  for mask in masks.iter().filter(|m| m.page == page) {
+  for mask in masks
+    .iter()
+    .filter(|m| m.page == page && m.kind == MaskKind::Cover)
+  {
     let [l, t, r, b] = mask.bounds;
     let left = ((l * size.0 as f64).floor() as i32 - 2 - region.x).clamp(0, region.width);
     let top = ((t * size.1 as f64).floor() as i32 - 2 - region.y).clamp(0, region.height);
@@ -119,8 +122,8 @@ pub fn mask_pixels(
     let bottom = ((b * size.1 as f64).ceil() as i32 + 2 - region.y).clamp(0, region.height);
     for y in top..bottom {
       for x in left..right {
-        // Мозаика не зависит от исходных пикселей и поэтому не сохраняет их значения.
-        let shade = 72 + (((x + region.x) / 16 + (y + region.y) / 16).rem_euclid(2) * 24) as u8;
+        // Полное скрытие не зависит от исходных пикселей и не сохраняет их значения.
+        let shade = 80;
         let i = ((y * region.width + x) * 4) as usize;
         pixels[i..i + 4].copy_from_slice(&[shade, shade, shade, 255]);
       }
@@ -205,6 +208,24 @@ pub fn clean_pdf(
       return Err("Страница слишком велика для защищённого экспорта при 300 dpi.".into());
     }
     let mut resources = String::new();
+    let mut grids = Vec::new();
+    for mask in masks.iter().filter(|m| m.page == page) {
+      if let MaskKind::Pixelate { block_mm } = mask.kind {
+        if !grids.iter().any(|(mm, _)| *mm == block_mm) {
+          let key = crate::pixelate::key(page, (w, h), block_mm, states)?;
+          let grid = crate::pixelate::render_grid(
+            |key| {
+              if cancelled() {
+                return Err("Сохранение отменено.".into());
+              }
+              render(key)
+            },
+            &key,
+          )?;
+          grids.push((block_mm, grid));
+        }
+      }
+    }
     let mut commands = String::new();
     let mut n = 0;
     for y in (0..size.1).step_by(1024) {
@@ -228,6 +249,12 @@ pub fn clean_pdf(
         };
         let image = render(&key)?;
         let mut pixels = (*image.pixels).clone();
+        for mask in masks.iter().filter(|m| m.page == page) {
+          if let MaskKind::Pixelate { block_mm } = mask.kind {
+            let grid = &grids.iter().find(|(mm, _)| *mm == block_mm).unwrap().1;
+            crate::pixelate::apply(&mut pixels, size, region, mask, grid, masks);
+          }
+        }
         mask_pixels(&mut pixels, size, region, masks, page);
         let rgb: Vec<_> = pixels
           .as_chunks::<4>()
@@ -300,6 +327,7 @@ mod tests {
       .join("");
     let path = std::env::temp_dir().join(format!("astra-safe-test-{token}.pdf"));
     let masks = vec![Mask {
+      kind: MaskKind::Cover,
       page: 0,
       bounds: [0., 0., 1., 1.],
     }];
@@ -351,6 +379,7 @@ mod tests {
   #[test]
   fn masks_erase_pixels_across_tile_boundaries_and_all_rotations_roundtrip() {
     let mask = Mask {
+      kind: MaskKind::Cover,
       page: 0,
       bounds: [0.45, 0.25, 0.55, 0.75],
     };

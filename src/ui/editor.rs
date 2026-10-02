@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   dialogs,
-  editing::{Mask, Operation, PageObject},
+  editing::{Mask, MaskKind, Operation, PageObject},
   engine::Client,
   export, vault,
 };
@@ -19,6 +19,10 @@ const HISTORY: usize = 48;
 const ABOUT: usize = 49;
 const VIEW: usize = 50;
 const HELP: usize = 51;
+const COVER: usize = 52;
+const PIXEL_SMALL: usize = 53;
+const PIXEL_MEDIUM: usize = 54;
+pub const PIXEL_LARGE: usize = 55;
 
 #[derive(Default, PartialEq)]
 enum Mode {
@@ -26,6 +30,7 @@ enum Mode {
   View,
   Select,
   Mask,
+  Pixelate,
 }
 enum ResultItem {
   Objects {
@@ -55,6 +60,27 @@ pub(super) struct Editor {
   undo: Vec<PathBuf>,
   receiver: Option<mpsc::Receiver<JobMessage>>,
   pub notice: Option<String>,
+  pixel_mm: u8,
+  pub grids: Option<Cache>,
+  mosaic_plan: Vec<RenderKey>,
+}
+
+impl Editor {
+  pub(super) fn probe(&self) -> serde_json::Value {
+    serde_json::json!({
+      "masks": self.masks,
+      "grids": self.mosaic_plan.iter().map(|k| [k.page as i32, k.width, k.height]).collect::<Vec<_>>(),
+      "ready": self.mosaic_plan.iter().filter(|k| self.grids.as_ref().and_then(|c| c.peek(k)).is_some()).count(),
+      "bytes": self.grids.as_ref().map_or(0, |c| c.bytes)
+    })
+  }
+
+  pub(super) fn reset(&mut self) {
+    *self = Self {
+      pixel_mm: self.pixel_mm,
+      ..Self::default()
+    };
+  }
 }
 
 pub(super) unsafe fn menu(hwnd: HWND) {
@@ -81,7 +107,11 @@ pub(super) unsafe fn menu(hwnd: HWND) {
     (
       "Скрытие информации",
       vec![
-        (MASK, "Выделить области мышью"),
+        (MASK, "Пикселизация содержимого — выделить область"),
+        (COVER, "Полное скрытие — выделить область"),
+        (PIXEL_SMALL, "Мелкие блоки · 3 мм"),
+        (PIXEL_MEDIUM, "Средние блоки · 6 мм"),
+        (PIXEL_LARGE, "Крупные блоки · 12 мм"),
         (SAFE_SAVE, "Сохранить очищенный PDF…"),
         (RESTORE, "Восстановить оригинал по ключу…"),
         (CANCEL, "Отменить текущую операцию"),
@@ -103,9 +133,63 @@ pub(super) unsafe fn menu(hwnd: HWND) {
     AppendMenuW(menu, MF_POPUP, popup as usize, wide(name).as_ptr());
   }
   SetMenu(hwnd, menu);
+  CheckMenuRadioItem(
+    menu,
+    PIXEL_SMALL as u32,
+    PIXEL_LARGE as u32,
+    PIXEL_MEDIUM as u32,
+    MF_BYCOMMAND,
+  );
 }
 
 impl App {
+  pub(super) unsafe fn request_mosaics(&mut self) {
+    let mut plan = Vec::new();
+    for page in self.visible_pages() {
+      let Some(&size) = self.sizes.get(page) else {
+        continue;
+      };
+      let mut blocks: Vec<u8> = self
+        .editor
+        .masks
+        .iter()
+        .chain(self.editor.drag.iter())
+        .filter_map(|m| match m.kind {
+          MaskKind::Pixelate { block_mm } if m.page == page => Some(block_mm),
+          _ => None,
+        })
+        .collect();
+      if self.editor.mode == Mode::Pixelate {
+        blocks.push(if self.editor.pixel_mm == 0 {
+          6
+        } else {
+          self.editor.pixel_mm
+        });
+      }
+      blocks.sort_unstable();
+      blocks.dedup();
+      for block in blocks {
+        if let Ok(key) = crate::pixelate::key(page, size, block, &self.states) {
+          plan.push(key);
+        }
+      }
+    }
+    if plan == self.editor.mosaic_plan {
+      return;
+    }
+    let cache = self
+      .editor
+      .grids
+      .get_or_insert_with(|| Cache::with_count(16 * 1024 * 1024, 32));
+    let missing = plan
+      .iter()
+      .filter(|key| cache.peek(key).is_none())
+      .cloned()
+      .collect();
+    self.editor.mosaic_plan = plan;
+    let _ = self.worker.sender.mosaic_batch(self.generation, missing);
+  }
+
   unsafe fn notice(&mut self, value: String) {
     self.editor.notice = Some(value);
     PostMessageW(self.hwnd, WM_APP + 23, 0, 0);
@@ -250,9 +334,31 @@ impl App {
       let Some((page, p)) = self.page_point(point, None) else {
         return;
       };
-      if self.editor.mode == Mode::Mask {
+      if matches!(self.editor.mode, Mode::Mask | Mode::Pixelate) {
+        if self.editor.mode == Mode::Pixelate {
+          let block = if self.editor.pixel_mm == 0 {
+            6
+          } else {
+            self.editor.pixel_mm
+          };
+          if let Err(error) = crate::pixelate::key(page, self.sizes[page], block, &self.states) {
+            self.notice(error);
+            return;
+          }
+        }
         self.editor.start = Some(p);
         self.editor.drag = Some(Mask {
+          kind: if self.editor.mode == Mode::Pixelate {
+            MaskKind::Pixelate {
+              block_mm: if self.editor.pixel_mm == 0 {
+                6
+              } else {
+                self.editor.pixel_mm
+              },
+            }
+          } else {
+            MaskKind::Cover
+          },
           page,
           bounds: [p.0, p.1, p.0, p.1],
         });
@@ -281,6 +387,7 @@ impl App {
       if let (Some(drag), Some(start)) = (&self.editor.drag, self.editor.start) {
         if let Some((page, p)) = self.page_point(point, Some(drag.page)) {
           let mask = Mask {
+            kind: drag.kind,
             page,
             bounds: [
               p.0.min(start.0),
@@ -306,14 +413,93 @@ impl App {
       self.editor.start = None;
     }
     InvalidateRect(self.canvas, ptr::null(), 0);
+    self.request_mosaics();
     InvalidateRect(self.hwnd, ptr::null(), 0);
   }
 
   pub(super) unsafe fn editor_paint(&self, dc: HDC) {
-    for mask in self.editor.masks.iter().chain(self.editor.drag.iter()) {
+    let masks: Vec<_> = self
+      .editor
+      .masks
+      .iter()
+      .chain(self.editor.drag.iter())
+      .cloned()
+      .collect();
+    let mut viewport: RECT = std::mem::zeroed();
+    GetClientRect(self.canvas, &mut viewport);
+    for mask in masks
+      .iter()
+      .filter(|m| matches!(m.kind, MaskKind::Pixelate { .. }))
+      .chain(masks.iter().filter(|m| m.kind == MaskKind::Cover))
+    {
       let Some(rect) = self.editor_rect(mask.page, mask.bounds) else {
         continue;
       };
+      if let MaskKind::Pixelate { block_mm } = mask.kind {
+        let grid = crate::pixelate::key(mask.page, self.sizes[mask.page], block_mm, &self.states)
+          .ok()
+          .and_then(|key| self.editor.grids.as_ref()?.peek(&key));
+        if let Some(grid) = grid {
+          let page = self.editor_rect(mask.page, [0., 0., 1., 1.]).unwrap();
+          let clip = RECT {
+            left: rect.left.max(viewport.left),
+            top: rect.top.max(viewport.top),
+            right: rect.right.min(viewport.right),
+            bottom: rect.bottom.min(viewport.bottom),
+          };
+          if clip.right <= clip.left || clip.bottom <= clip.top {
+            continue;
+          }
+          let width = f64::from(page.right - page.left);
+          let height = f64::from(page.bottom - page.top);
+          let visible = export::rotate_bounds(
+            [
+              f64::from(clip.left - page.left) / width,
+              f64::from(clip.top - page.top) / height,
+              f64::from(clip.right - page.left) / width,
+              f64::from(clip.bottom - page.top) / height,
+            ],
+            -self.rotation,
+          );
+          let x0 = (visible[0] * grid.width as f64).floor().max(0.) as i32;
+          let y0 = (visible[1] * grid.height as f64).floor().max(0.) as i32;
+          let x1 = (visible[2] * grid.width as f64)
+            .ceil()
+            .min(grid.width as f64) as i32;
+          let y1 = (visible[3] * grid.height as f64)
+            .ceil()
+            .min(grid.height as f64) as i32;
+          for y in y0..y1 {
+            for x in x0..x1 {
+              let cell =
+                export::rotate_bounds(crate::pixelate::cell_bounds(grid, x, y), self.rotation);
+              let r = RECT {
+                left: (page.left + (cell[0] * width).floor() as i32).max(clip.left),
+                top: (page.top + (cell[1] * height).floor() as i32).max(clip.top),
+                right: (page.left + (cell[2] * width).ceil() as i32).min(clip.right),
+                bottom: (page.top + (cell[3] * height).ceil() as i32).min(clip.bottom),
+              };
+              let c = crate::pixelate::color(grid, x, y, &masks, mask.page);
+              fill(
+                dc,
+                &r,
+                u32::from(c[2]) | u32::from(c[1]) << 8 | u32::from(c[0]) << 16,
+              );
+            }
+          }
+          continue;
+        }
+        fill(dc, &rect, 0x00ece9e6);
+        text(
+          dc,
+          rect,
+          "Готовлю пикселизацию…",
+          0x00786858,
+          self.font,
+          DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        continue;
+      }
       fill(dc, &rect, 0x00505050);
       text(
         dc,
@@ -441,22 +627,62 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     return Err("Есть метки скрытия. Сохраните очищенный PDF через меню «Скрытие информации» или отмените метки. Обычная копия их не применяет.".into());
   }
   match id {
-    SELECT | MASK | VIEW => {
+    SELECT | MASK | COVER | VIEW => {
       with_app(|a| {
         a.editor.mode = match id {
           SELECT => Mode::Select,
-          MASK => Mode::Mask,
+          MASK => Mode::Pixelate,
+          COVER => Mode::Mask,
           _ => Mode::View,
         };
         a.editor.selected = None;
         a.status = match id {
           SELECT => "Нажмите на объект. Повторный щелчок выбирает следующий объект под курсором.",
-          MASK => "Зажмите левую кнопку и выделите область. Затем сохраните очищенный PDF.",
+          MASK => "Выделите область для пикселизации. Размер блоков — в меню. Пикселизация не гарантирует секретность.",
+          COVER => "Выделите область полного скрытия. Затем сохраните очищенный PDF.",
           _ => "Просмотр",
         }
         .into();
         InvalidateRect(a.hwnd, ptr::null(), 0);
         InvalidateRect(a.canvas, ptr::null(), 0);
+        a.request_mosaics();
+      });
+    }
+    PIXEL_SMALL | PIXEL_MEDIUM | PIXEL_LARGE => {
+      let block_mm = match id {
+        PIXEL_SMALL => 3,
+        PIXEL_LARGE => 12,
+        _ => 6,
+      };
+      let valid = with_app(|a| {
+        for m in &a.editor.masks {
+          if matches!(m.kind, MaskKind::Pixelate { .. }) {
+            crate::pixelate::key(m.page, a.sizes[m.page], block_mm, &a.states)?;
+          }
+        }
+        Ok::<_, String>(())
+      });
+      if let Some(result) = valid {
+        result?;
+      }
+      with_app(|a| {
+        a.editor.pixel_mm = block_mm;
+        for mask in &mut a.editor.masks {
+          if matches!(mask.kind, MaskKind::Pixelate { .. }) {
+            mask.kind = MaskKind::Pixelate { block_mm };
+          }
+        }
+        CheckMenuRadioItem(
+          GetMenu(hwnd),
+          PIXEL_SMALL as u32,
+          PIXEL_LARGE as u32,
+          id as u32,
+          MF_BYCOMMAND,
+        );
+        a.status = format!("Размер блоков пикселизации: {block_mm} мм на странице. Настройка применена к отмеченным областям.");
+        a.request_mosaics();
+        InvalidateRect(a.canvas, ptr::null(), 0);
+        InvalidateRect(a.hwnd, ptr::null(), 0);
       });
     }
     UNDO => {
@@ -535,7 +761,24 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
       if masks.is_empty() {
         return Err("Сначала выделите области через меню «Скрытие информации».".into());
       }
-      if MessageBoxW(hwnd,wide("Очищенная копия будет состоять из изображений страниц, 300 dpi. Текст, слои, вложения и история исходника не попадут в неё.\n\nОтдельный зашифрованный оригинал и случайный ключ будут сохранены в личном каталоге Astra PDF. Не отправляйте ключ заказчику.\n\nПродолжить?").as_ptr(),wide("Сохранить очищенный PDF").as_ptr(),MB_YESNO|MB_ICONINFORMATION|MB_DEFBUTTON2)!=IDYES { return Ok(()); }
+      let warning = if masks
+        .iter()
+        .any(|m| matches!(m.kind, MaskKind::Pixelate { .. }))
+      {
+        "Пикселизация сохраняет средние цвета содержимого. Некоторые детали и текст могут быть угаданы или распознаны. Для секретных данных используйте «Полное скрытие».\n\n"
+      } else {
+        ""
+      };
+      let message = format!("{warning}Копия будет состоять из изображений страниц, 300 dpi. Исходные текстовые объекты, слои, вложения и история в неё не попадут.\n\nОтдельный зашифрованный оригинал и ключ будут сохранены у вас. Не отправляйте их заказчику.\n\nПродолжить?");
+      if MessageBoxW(
+        hwnd,
+        wide(&message).as_ptr(),
+        wide("Сохранить PDF с обработанными областями").as_ptr(),
+        MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
+      ) != IDYES
+      {
+        return Ok(());
+      }
       let Some(output) = output_pdf(
         hwnd,
         &path,
