@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "astra-pdf"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.6"
 dependencies = [
  "chacha20poly1305",
  "flate2",

@@ -53,6 +53,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла независимая проверка редактирования и очистки PDF' }
   & $Python "$PSScriptRoot\verify_pixel_ui.py" $exe "$outputDir\editing" "$outputDir\pixel-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка пикселизации в окне' }
+  & $Python "$PSScriptRoot\verify_editor_ui.py" $exe "$outputDir\editing" "$outputDir\editor-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка инструментов и отмены' }
   $env:ASTRA_SMOKE_PRINT = '1'
   Invoke-Viewer @('--ui-smoke', (Quoted $demo), (Quoted "$outputDir\window.png"))
   $env:ASTRA_SMOKE_PRINT = $null

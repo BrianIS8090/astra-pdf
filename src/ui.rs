@@ -27,6 +27,7 @@ use windows_sys::Win32::{
 
 const OPEN: usize = 10;
 mod editor;
+mod tools;
 const PRINT: usize = 11;
 const PREV: usize = 12;
 const NEXT: usize = 13;
@@ -63,6 +64,7 @@ struct App {
   hwnd: HWND,
   canvas: HWND,
   controls: Vec<(usize, HWND)>,
+  tool_labels: Vec<Vec<u16>>,
   font: HFONT,
   big_font: HFONT,
   dpi: u32,
@@ -184,7 +186,6 @@ impl App {
       (WIDTH, "По ширине"),
       (ROTATE, "Повернуть"),
       (RESET, "Сбросить слои"),
-      (CANCEL, "Отмена печати"),
       (TAB_PAGES, "Страницы"),
       (TAB_LAYERS, "Слои"),
     ] {
@@ -250,7 +251,7 @@ impl App {
       0,
       wide("AstraPdfCanvas").as_ptr(),
       wide("Просмотр страницы").as_ptr(),
-      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL,
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN,
       0,
       0,
       1,
@@ -261,6 +262,7 @@ impl App {
       ptr::null(),
     );
     DragAcceptFiles(self.hwnd, 1);
+    self.setup_editor_controls();
     self.layout();
     self.enable_controls();
     SetTimer(self.hwnd, 3, 150, None);
@@ -328,16 +330,8 @@ impl App {
     GetClientRect(self.hwnd, &mut r);
     let width = (r.right as f64 * 96. / self.dpi as f64) as i32;
     let height = (r.bottom as f64 * 96. / self.dpi as f64) as i32;
-    let wrapped = width < if self.printing { 1120 } else { 980 };
-    let compact_print = wrapped && width < 700 && self.printing;
-    let top = if compact_print {
-      152
-    } else if wrapped {
-      108
-    } else {
-      64
-    };
-    self.toolbar_height = top;
+    let wrapped = width < 980;
+    let nav_top = if wrapped { 108 } else { 64 };
     for (id, x, w) in [
       (OPEN, 16, 90),
       (PRINT, 114, 82),
@@ -353,20 +347,14 @@ impl App {
       self.place(id, x, 14, w, 32);
     }
     self.place(CONTINUOUS, 824, 14, 134, 32);
-    self.place(CANCEL, 970, 14, 138, 32);
     if wrapped {
       self.place(FIT, 16, 58, 94, 32);
       self.place(WIDTH, 118, 58, 112, 32);
       self.place(ROTATE, 238, 58, 112, 32);
       self.place(CONTINUOUS, 358, 58, 142, 32);
-      self.place(
-        CANCEL,
-        if compact_print { 16 } else { 508 },
-        if compact_print { 102 } else { 58 },
-        138,
-        32,
-      );
     }
+    let top = self.layout_editor_bar(width, nav_top);
+    self.toolbar_height = top;
     self.place(TAB_PAGES, 12, top + 13, 107, 32);
     self.place(TAB_LAYERS, 124, top + 13, 104, 32);
     self.place(VIEW_MODE, 12, top + 54, 216, 120);
@@ -432,10 +420,7 @@ impl App {
       } as usize,
       0,
     );
-    ShowWindow(
-      self.control(CANCEL),
-      if self.printing { SW_SHOW } else { SW_HIDE },
-    );
+    self.position_editor_actions();
     self.center_page_number();
     self.update_scroll();
     InvalidateRect(self.hwnd, ptr::null(), 0);
@@ -466,7 +451,12 @@ impl App {
       let enabled = match *id {
         OPEN => !self.printing,
         TAB_PAGES | TAB_LAYERS | LAYER_NOTE => true,
-        CANCEL => self.printing || self.editor.busy,
+        CANCEL => self.printing || self.editor.can_cancel(),
+        editor::UNDO => loaded && self.editor.can_undo() && !self.printing,
+        editor::SAFE_SAVE => !self.editor.masks.is_empty() && !self.printing,
+        editor::SELECT | editor::MASK | editor::COVER | editor::MASK_SELECT => {
+          loaded && !self.printing
+        }
         PREV => loaded && self.page > 0,
         NEXT => loaded && self.page + 1 < self.sizes.len(),
         PRINT => loaded && !self.printing,
@@ -781,6 +771,7 @@ impl App {
     self.refresh_status();
     self.request_thumbnails();
     self.request_mosaics();
+    self.position_editor_actions();
     InvalidateRect(self.canvas, ptr::null(), 0);
   }
 
@@ -926,6 +917,7 @@ impl App {
     self.reflow();
     self.rendering = true;
     self.refresh_status();
+    self.position_editor_actions();
     InvalidateRect(self.canvas, ptr::null(), 0);
     SetTimer(self.hwnd, 1, 65, None);
   }
@@ -971,7 +963,7 @@ impl App {
     if self.editor.busy && id != CANCEL {
       return;
     }
-    if (editor::PAGES..=editor::PIXEL_LARGE).contains(&id) {
+    if (editor::PAGES..=editor::MASK_DELETE).contains(&id) {
       PostMessageW(self.hwnd, WM_APP + 21, id, 0);
       return;
     }
@@ -1046,8 +1038,7 @@ impl App {
         self.request();
       }
       CANCEL => {
-        self.cancel.store(true, Ordering::Relaxed);
-        self.status = "Отменяю операцию…".into();
+        self.cancel_editor();
       }
       PRINT if !self.sizes.is_empty() && !self.printing && !self.dialog_open => {
         PostMessageW(self.hwnd, WM_APP + 13, 0, 0);
@@ -1886,6 +1877,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       if item.CtlID == PAGE_LIST as u32 {
         app.paint_thumbnail(item);
         Some(1)
+      } else if tools::is_button(item.CtlID as usize) {
+        app.paint_editor_button(item);
+        Some(1)
       } else {
         None
       }
@@ -2028,6 +2022,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
   let result = with_app(|app| match msg {
+    WM_COMMAND if (wp >> 16) as u32 == BN_CLICKED => {
+      app.action(wp & 0xffff);
+      Some(0)
+    }
+    WM_DRAWITEM => {
+      let item = &*(lp as *const DRAWITEMSTRUCT);
+      if tools::is_button(item.CtlID as usize) {
+        app.paint_editor_button(item);
+        Some(1)
+      } else {
+        None
+      }
+    }
+    WM_SETCURSOR if (lp & 0xffff) == HTCLIENT as isize => {
+      SetCursor(LoadCursorW(
+        ptr::null_mut(),
+        if app.editor.drawing() {
+          IDC_CROSS
+        } else {
+          IDC_ARROW
+        },
+      ));
+      Some(1)
+    }
     WM_PAINT => {
       app.paint_canvas(None);
       Some(0)
@@ -2126,6 +2144,17 @@ unsafe fn hotkey(msg: &MSG) -> bool {
     let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
     let edit = GetFocus() == a.control(PAGE_EDIT);
     let canvas_focus = GetFocus() == a.canvas || GetFocus() == a.hwnd;
+    if a.dialog_open {
+      return false;
+    }
+    if key == VK_ESCAPE && (a.printing || a.editor.can_cancel()) {
+      a.action(CANCEL);
+      return true;
+    }
+    if key == VK_DELETE && !edit && a.editor.selection_is_mask() {
+      a.action(editor::MASK_DELETE);
+      return true;
+    }
     if !edit && canvas_focus && !ctrl {
       let code = match key {
         VK_PRIOR => Some(SB_PAGEUP),
@@ -2150,6 +2179,7 @@ unsafe fn hotkey(msg: &MSG) -> bool {
         0x30 => Some(FIT),
         0x32 => Some(WIDTH),
         0x52 => Some(ROTATE),
+        0x5a if !edit => Some(editor::UNDO),
         _ => None,
       }
     } else if !edit {
@@ -2176,10 +2206,6 @@ unsafe fn hotkey(msg: &MSG) -> bool {
         wide(&(a.page + 1).to_string()).as_ptr(),
       );
       SetFocus(a.canvas);
-      return true;
-    }
-    if key == VK_ESCAPE && (a.printing || a.editor.busy) {
-      a.action(CANCEL);
       return true;
     }
     if ctrl && key == 0x31 {
@@ -2245,6 +2271,7 @@ pub fn run(
     let worker = Worker::start(hwnd as usize, dll);
     let mut app = App {
       editor: editor::Editor::default(),
+      tool_labels: Vec::new(),
       hwnd,
       canvas: ptr::null_mut(),
       controls: vec![],

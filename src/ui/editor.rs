@@ -8,29 +8,36 @@ use crate::{
 use std::{path::Path, sync::mpsc};
 
 pub const PAGES: usize = 40;
-const SELECT: usize = 41;
-const CHANGE_TEXT: usize = 42;
-const DELETE: usize = 43;
-const MASK: usize = 44;
-const SAFE_SAVE: usize = 45;
+pub(super) const SELECT: usize = 41;
+pub(super) const CHANGE_TEXT: usize = 42;
+pub(super) const DELETE: usize = 43;
+pub(super) const MASK: usize = 44;
+pub(super) const SAFE_SAVE: usize = 45;
 const RESTORE: usize = 46;
-const UNDO: usize = 47;
+pub(super) const UNDO: usize = 47;
 const HISTORY: usize = 48;
 const ABOUT: usize = 49;
 const VIEW: usize = 50;
 const HELP: usize = 51;
-const COVER: usize = 52;
+pub(super) const COVER: usize = 52;
 const PIXEL_SMALL: usize = 53;
 const PIXEL_MEDIUM: usize = 54;
 pub const PIXEL_LARGE: usize = 55;
+pub(super) const MASK_SELECT: usize = 56;
+pub(super) const MASK_DELETE: usize = 57;
 
-#[derive(Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Mode {
   #[default]
   View,
   Select,
   Mask,
   Pixelate,
+  Masks,
+}
+enum MaskUndo {
+  Added(usize),
+  Removed(usize, Mask),
 }
 enum ResultItem {
   Objects {
@@ -54,6 +61,8 @@ pub(super) struct Editor {
   pub busy: bool,
   mode: Mode,
   pub masks: Vec<Mask>,
+  selected_mask: Option<usize>,
+  mask_undo: Vec<MaskUndo>,
   drag: Option<Mask>,
   start: Option<(f64, f64)>,
   selected: Option<(usize, PageObject)>,
@@ -69,10 +78,81 @@ impl Editor {
   pub(super) fn probe(&self) -> serde_json::Value {
     serde_json::json!({
       "masks": self.masks,
+      "mode": format!("{:?}", self.mode),
+      "selected_mask": self.selected_mask,
+      "selected_object": self.selected.as_ref().map(|(p, o)| serde_json::json!({"page":p,"index":o.index,"kind":o.kind,"bounds":o.bounds})),
+      "busy": self.busy,
+      "dragging": self.drag.is_some(),
       "grids": self.mosaic_plan.iter().map(|k| [k.page as i32, k.width, k.height]).collect::<Vec<_>>(),
       "ready": self.mosaic_plan.iter().filter(|k| self.grids.as_ref().and_then(|c| c.peek(k)).is_some()).count(),
       "bytes": self.grids.as_ref().map_or(0, |c| c.bytes)
     })
+  }
+
+  fn add_mask(&mut self, mask: Mask) {
+    self.mask_undo.push(MaskUndo::Added(self.masks.len()));
+    self.masks.push(mask);
+    self.selected_mask = None;
+  }
+
+  fn remove_mask(&mut self) {
+    if let Some(index) = self.selected_mask.take().filter(|i| *i < self.masks.len()) {
+      self
+        .mask_undo
+        .push(MaskUndo::Removed(index, self.masks.remove(index)));
+    }
+  }
+
+  fn undo_mask(&mut self) -> bool {
+    let Some(change) = self.mask_undo.pop() else {
+      return false;
+    };
+    match change {
+      MaskUndo::Added(index) => {
+        self.masks.remove(index);
+      }
+      MaskUndo::Removed(index, mask) => self.masks.insert(index, mask),
+    }
+    self.selected_mask = None;
+    true
+  }
+
+  fn stop_tool(&mut self) {
+    self.mode = Mode::View;
+    self.drag = None;
+    self.start = None;
+    self.selected = None;
+    self.selected_mask = None;
+  }
+
+  pub(super) fn active(&self, id: usize) -> bool {
+    matches!(
+      (id, self.mode),
+      (SELECT, Mode::Select)
+        | (MASK, Mode::Pixelate)
+        | (COVER, Mode::Mask)
+        | (MASK_SELECT, Mode::Masks)
+    )
+  }
+
+  pub(super) fn can_cancel(&self) -> bool {
+    self.busy
+      || self.mode != Mode::View
+      || self.drag.is_some()
+      || self.selected_mask.is_some()
+      || self.selected.is_some()
+  }
+
+  pub(super) fn can_undo(&self) -> bool {
+    !self.mask_undo.is_empty() || !self.undo.is_empty()
+  }
+
+  pub(super) fn selection_is_mask(&self) -> bool {
+    self.selected_mask.is_some()
+  }
+
+  pub(super) fn drawing(&self) -> bool {
+    matches!(self.mode, Mode::Mask | Mode::Pixelate)
   }
 
   pub(super) fn reset(&mut self) {
@@ -109,6 +189,8 @@ pub(super) unsafe fn menu(hwnd: HWND) {
       vec![
         (MASK, "Пикселизация содержимого — выделить область"),
         (COVER, "Полное скрытие — выделить область"),
+        (MASK_SELECT, "Выбрать скрывающий блок"),
+        (MASK_DELETE, "Убрать выбранный блок\tDelete"),
         (PIXEL_SMALL, "Мелкие блоки · 3 мм"),
         (PIXEL_MEDIUM, "Средние блоки · 6 мм"),
         (PIXEL_LARGE, "Крупные блоки · 12 мм"),
@@ -143,6 +225,113 @@ pub(super) unsafe fn menu(hwnd: HWND) {
 }
 
 impl App {
+  pub(super) unsafe fn cancel_editor(&mut self) {
+    self.editor.stop_tool();
+    ReleaseCapture();
+    if self.printing || self.editor.busy {
+      self.cancel.store(true, Ordering::Relaxed);
+      self.status = "Отменяю операцию…".into();
+    } else {
+      self.status =
+        "Просмотр · инструмент выключен. Созданные блоки сохранены в этом сеансе.".into();
+    }
+    self.request_mosaics();
+    self.sync_editor_controls();
+    SetFocus(self.canvas);
+    InvalidateRect(self.canvas, ptr::null(), 0);
+  }
+
+  pub(super) unsafe fn sync_editor_controls(&self) {
+    self.enable_controls();
+    for id in [SELECT, MASK, COVER, MASK_SELECT, UNDO, SAFE_SAVE, CANCEL] {
+      CheckMenuItem(
+        GetMenu(self.hwnd),
+        id as u32,
+        MF_BYCOMMAND
+          | if self.editor.active(id) {
+            MF_CHECKED
+          } else {
+            MF_UNCHECKED
+          },
+      );
+      InvalidateRect(self.control(id), ptr::null(), 1);
+    }
+    self.position_editor_actions();
+  }
+
+  pub(super) unsafe fn position_editor_actions(&self) {
+    let target = if self.editor.busy || self.printing || self.dialog_open {
+      None
+    } else if let Some(mask) = self
+      .editor
+      .selected_mask
+      .and_then(|i| self.editor.masks.get(i))
+    {
+      self
+        .editor_rect(mask.page, mask.bounds)
+        .map(|r| (r, true, false))
+    } else {
+      self.editor.selected.as_ref().and_then(|(p, o)| {
+        self
+          .editor_rect(*p, o.bounds)
+          .map(|r| (r, false, o.kind == 1))
+      })
+    };
+    let view = self.viewport();
+    let target =
+      target.filter(|(r, _, _)| r.right > 0 && r.left < view.0 && r.bottom > 0 && r.top < view.1);
+    let Some((r, mask, is_text)) = target else {
+      for id in [CHANGE_TEXT, DELETE, MASK_DELETE] {
+        ShowWindow(self.control(id), SW_HIDE);
+      }
+      return;
+    };
+    let button_width = self.unit(if mask { 142 } else { 112 });
+    let gap = self.unit(4);
+    let count = if mask { 1 } else { 2 };
+    let width = count * button_width + (count - 1) * gap;
+    let height = self.unit(36);
+    let x = (r.left.max(0) + (r.right.min(view.0) - r.left.max(0) - width) / 2).clamp(
+      self.unit(4),
+      (view.0 - width - self.unit(4)).max(self.unit(4)),
+    );
+    let y = if r.top >= height + gap {
+      r.top - height - gap
+    } else {
+      (r.bottom + gap).min(view.1 - height - gap).max(gap)
+    };
+    let ids: &[usize] = if mask {
+      &[MASK_DELETE]
+    } else {
+      &[CHANGE_TEXT, DELETE]
+    };
+    for id in [CHANGE_TEXT, DELETE, MASK_DELETE] {
+      if !ids.contains(&id) {
+        ShowWindow(self.control(id), SW_HIDE);
+      }
+    }
+    for (i, id) in ids.iter().enumerate() {
+      let h = self.control(*id);
+      MoveWindow(
+        h,
+        x + i as i32 * (button_width + gap),
+        y,
+        button_width,
+        height,
+        1,
+      );
+      EnableWindow(h, (*id != CHANGE_TEXT || is_text) as i32);
+      SetWindowPos(
+        h,
+        HWND_TOP,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+      );
+    }
+  }
   pub(super) unsafe fn request_mosaics(&mut self) {
     let mut plan = Vec::new();
     for page in self.visible_pages() {
@@ -211,6 +400,7 @@ impl App {
     self.editor.busy = true;
     self.status = "Выполняю операцию…  ·  Esc — отмена".into();
     self.enable_controls();
+    self.position_editor_actions();
     let hwnd = self.hwnd as usize;
     std::thread::spawn(move || {
       let result = run(cancel, sender.clone());
@@ -251,12 +441,21 @@ impl App {
               self.open(path);
               self.page = page;
               self.editor.undo = undo;
+              self.editor.mode = Mode::Select;
             }
             Ok(ResultItem::Objects {
               page,
               point,
               objects,
             }) => {
+              if self.cancel.load(Ordering::Relaxed) || self.editor.mode != Mode::Select {
+                self.status = "Выбор объекта отменён.".into();
+                self.sync_editor_controls();
+                if self.closing {
+                  PostQuitMessage(0);
+                }
+                continue;
+              }
               let old = self
                 .editor
                 .selected
@@ -292,12 +491,15 @@ impl App {
             }
             Err(error) => {
               self.status = error.clone();
-              self.notice(error);
+              if !self.cancel.load(Ordering::Relaxed) {
+                self.notice(error);
+              }
             }
           }
           if self.closing {
             PostQuitMessage(0);
           }
+          self.sync_editor_controls();
         }
       }
       InvalidateRect(self.hwnd, ptr::null(), 0);
@@ -331,9 +533,37 @@ impl App {
     }
     let point = ((lp as u16 as i16) as i32, ((lp >> 16) as u16 as i16) as i32);
     if msg == WM_LBUTTONDOWN {
+      self.editor.selected_mask = None;
       let Some((page, p)) = self.page_point(point, None) else {
+        self.editor.selected = None;
+        self.sync_editor_controls();
+        InvalidateRect(self.canvas, ptr::null(), 0);
         return;
       };
+      if matches!(self.editor.mode, Mode::View | Mode::Masks) {
+        self.editor.selected = None;
+        self.editor.selected_mask = self
+          .editor
+          .masks
+          .iter()
+          .enumerate()
+          .rev()
+          .filter(|(_, m)| {
+            m.page == page
+              && p.0 >= m.bounds[0]
+              && p.0 <= m.bounds[2]
+              && p.1 >= m.bounds[1]
+              && p.1 <= m.bounds[3]
+          })
+          .max_by_key(|(i, m)| (m.kind == MaskKind::Cover, *i))
+          .map(|(i, _)| i);
+        self.status = if self.editor.selected_mask.is_some() {
+          "Выбран скрывающий блок · Delete или «Убрать блок» · Esc — снять выделение"
+        } else {
+          "Нажмите на скрывающий блок, чтобы убрать его."
+        }
+        .into();
+      }
       if matches!(self.editor.mode, Mode::Mask | Mode::Pixelate) {
         if self.editor.mode == Mode::Pixelate {
           let block = if self.editor.pixel_mm == 0 {
@@ -370,6 +600,7 @@ impl App {
         let Some(path) = self.path.clone() else {
           return;
         };
+        self.editor.selected_mask = None;
         self.job(move |cancel, _| {
           let mut client = Client::spawn(&crate::pdfium_path())?;
           client.open_checked(&path, fingerprint, || cancel.load(Ordering::Relaxed))?;
@@ -399,7 +630,7 @@ impl App {
           self.editor.drag = Some(mask.clone());
           if msg == WM_LBUTTONUP {
             if mask.valid(self.sizes.len()) {
-              self.editor.masks.push(mask);
+              self.editor.add_mask(mask);
               self.status = format!("Областей скрытия: {}. Выберите «Сохранить очищенный PDF». Метки пока не сохранены.",self.editor.masks.len());
             }
             self.editor.drag = None;
@@ -414,6 +645,7 @@ impl App {
     }
     InvalidateRect(self.canvas, ptr::null(), 0);
     self.request_mosaics();
+    self.sync_editor_controls();
     InvalidateRect(self.hwnd, ptr::null(), 0);
   }
 
@@ -510,8 +742,14 @@ impl App {
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
       );
     }
-    if let Some((page, object)) = &self.editor.selected {
-      if let Some(rect) = self.editor_rect(*page, object.bounds) {
+    let selection = self
+      .editor
+      .selected_mask
+      .and_then(|i| self.editor.masks.get(i))
+      .map(|m| (m.page, m.bounds))
+      .or_else(|| self.editor.selected.as_ref().map(|(p, o)| (*p, o.bounds)));
+    if let Some((page, bounds)) = selection {
+      if let Some(rect) = self.editor_rect(page, bounds) {
         let pen = CreatePen(PS_SOLID, self.unit(2), 0x00c87818);
         let old_pen = SelectObject(dc, pen);
         let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -570,6 +808,7 @@ pub(super) unsafe fn command(hwnd: HWND, id: usize) {
     if let Err(e) = result {
       a.notice(e);
     }
+    a.sync_editor_controls();
   });
   PostMessageW(hwnd, WM_APP + 14, 0, 0);
 }
@@ -627,25 +866,31 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     return Err("Есть метки скрытия. Сохраните очищенный PDF через меню «Скрытие информации» или отмените метки. Обычная копия их не применяет.".into());
   }
   match id {
-    SELECT | MASK | COVER | VIEW => {
+    SELECT | MASK | COVER | MASK_SELECT | VIEW => {
       with_app(|a| {
-        a.editor.mode = match id {
+        let next = match id {
           SELECT => Mode::Select,
           MASK => Mode::Pixelate,
           COVER => Mode::Mask,
+          MASK_SELECT => Mode::Masks,
           _ => Mode::View,
         };
-        a.editor.selected = None;
-        a.status = match id {
+        let active = a.editor.mode == next;
+        a.editor.stop_tool();
+        ReleaseCapture();
+        a.editor.mode = if active { Mode::View } else { next };
+        a.status = match if active { VIEW } else { id } {
           SELECT => "Нажмите на объект. Повторный щелчок выбирает следующий объект под курсором.",
           MASK => "Выделите область для пикселизации. Размер блоков — в меню. Пикселизация не гарантирует секретность.",
           COVER => "Выделите область полного скрытия. Затем сохраните очищенный PDF.",
+          MASK_SELECT => "Нажмите на блок. Delete или кнопка над выделением убирает только выбранный блок. Esc — просмотр.",
           _ => "Просмотр",
         }
         .into();
         InvalidateRect(a.hwnd, ptr::null(), 0);
         InvalidateRect(a.canvas, ptr::null(), 0);
         a.request_mosaics();
+        SetFocus(a.canvas);
       });
     }
     PIXEL_SMALL | PIXEL_MEDIUM | PIXEL_LARGE => {
@@ -687,8 +932,8 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     }
     UNDO => {
       with_app(|a| {
-        if a.editor.masks.pop().is_some() {
-          a.status = "Последняя метка скрытия отменена.".into();
+        if a.editor.undo_mask() {
+          a.status = "Последнее изменение скрывающих блоков отменено.".into();
           InvalidateRect(a.canvas, ptr::null(), 0);
         } else if let Some(previous) = a.editor.undo.pop() {
           let undo = std::mem::take(&mut a.editor.undo);
@@ -697,6 +942,15 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
         } else {
           a.status = "Нет действий для отмены.".into();
         }
+      });
+    }
+    MASK_DELETE => {
+      with_app(|a| {
+        a.editor.remove_mask();
+        SetFocus(a.canvas);
+        a.status = "Блок убран. Ctrl+Z — вернуть его. Остальные блоки сохранены.".into();
+        a.request_mosaics();
+        InvalidateRect(a.canvas, ptr::null(), 0);
       });
     }
     PAGES => {
@@ -891,4 +1145,59 @@ unsafe fn restore(hwnd: HWND) {
       )))
     })
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn mask(left: f64) -> Mask {
+    Mask {
+      page: 0,
+      bounds: [left, 0.1, left + 0.1, 0.5],
+      kind: MaskKind::Cover,
+    }
+  }
+
+  #[test]
+  fn removing_any_block_and_undo_preserves_order_and_other_blocks() {
+    let mut editor = Editor::default();
+    editor.add_mask(mask(0.1));
+    editor.add_mask(mask(0.3));
+    editor.add_mask(mask(0.5));
+    editor.selected_mask = Some(1);
+    editor.remove_mask();
+    assert_eq!(
+      editor.masks.iter().map(|m| m.bounds[0]).collect::<Vec<_>>(),
+      vec![0.1, 0.5]
+    );
+    assert!(editor.undo_mask());
+    assert_eq!(
+      editor.masks.iter().map(|m| m.bounds[0]).collect::<Vec<_>>(),
+      vec![0.1, 0.3, 0.5]
+    );
+    assert!(editor.undo_mask());
+    assert!(editor.undo_mask());
+    assert_eq!(editor.masks.len(), 1);
+    assert!(editor.undo_mask());
+    assert!(editor.masks.is_empty());
+    assert!(!editor.undo_mask());
+  }
+
+  #[test]
+  fn escape_discards_unfinished_drag_but_preserves_committed_masks_and_history() {
+    let mut editor = Editor::default();
+    editor.add_mask(mask(0.1));
+    editor.mode = Mode::Pixelate;
+    editor.drag = Some(mask(0.3));
+    editor.start = Some((0.3, 0.1));
+    editor.selected_mask = Some(0);
+    editor.stop_tool();
+    assert_eq!(editor.mode, Mode::View);
+    assert!(editor.drag.is_none() && editor.start.is_none() && editor.selected_mask.is_none());
+    assert!(!editor.can_cancel());
+    assert_eq!(editor.masks.len(), 1);
+    assert!(editor.undo_mask());
+    assert!(editor.masks.is_empty());
+  }
 }
