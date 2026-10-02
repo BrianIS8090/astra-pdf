@@ -36,3 +36,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Выполнить тесты и собрать приложение
         run: .\scripts\build.ps1 -Test -Release
+      - name: Подготовить установщик
+        run: |
+          .\scripts\setup-installer.ps1
+          .\scripts\assemble.ps1 -Destination .\dist\installer-payload
+          .\scripts\build-installer.ps1 -PayloadDirectory .\dist\installer-payload -TestIdentity
+      - name: Проверить установку, восстановление и удаление
+        run: .\scripts\test-installer.ps1 -Installer .\dist\installer\AstraPDF-1.0.0-rc.3-setup-test-x64.exe -PayloadDirectory .\dist\installer-payload
+      - name: Собрать установщик выпуска
+        run: .\scripts\build-installer.ps1 -PayloadDirectory .\dist\installer-payload
