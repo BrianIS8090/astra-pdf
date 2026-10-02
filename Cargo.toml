@@ -1,6 +1,6 @@
 [package]
 name = "astra-pdf"
-version = "1.0.0-rc.7"
+version = "1.0.0-rc.8"
 edition = "2021"
 description = "Нативный просмотрщик PDF для Windows"
 license = "MIT"

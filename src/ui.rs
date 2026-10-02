@@ -189,20 +189,9 @@ impl App {
       (TAB_PAGES, "Страницы"),
       (TAB_LAYERS, "Слои"),
     ] {
-      let style = if id == TAB_PAGES || id == TAB_LAYERS {
-        BS_RADIOBUTTON | BS_PUSHLIKE
-      } else {
-        BS_PUSHBUTTON
-      };
-      self.create(id, "BUTTON", label, style as u32);
+      self.create(id, "BUTTON", label, BS_OWNERDRAW as u32);
     }
-    let continuous = self.create(
-      CONTINUOUS,
-      "BUTTON",
-      "Прокрутка",
-      (BS_AUTOCHECKBOX | BS_PUSHLIKE) as u32,
-    );
-    SendMessageW(continuous, BM_SETCHECK, BST_CHECKED as usize, 0);
+    self.create(CONTINUOUS, "BUTTON", "Прокрутка", BS_OWNERDRAW as u32);
     let mode = self.create(
       VIEW_MODE,
       "COMBOBOX",
@@ -330,34 +319,43 @@ impl App {
     GetClientRect(self.hwnd, &mut r);
     let width = (r.right as f64 * 96. / self.dpi as f64) as i32;
     let height = (r.bottom as f64 * 96. / self.dpi as f64) as i32;
-    let wrapped = width < 980;
-    let nav_top = if wrapped { 108 } else { 64 };
+    let wrapped = width < 1040;
     for (id, x, w) in [
-      (OPEN, 16, 90),
-      (PRINT, 114, 82),
-      (PREV, 221, 32),
-      (PAGE_EDIT, 259, 52),
-      (NEXT, 317, 32),
-      (MINUS, 381, 32),
-      (PLUS, 419, 32),
-      (FIT, 476, 94),
-      (WIDTH, 578, 112),
-      (ROTATE, 698, 112),
+      (OPEN, 12, 32),
+      (editor::SAVE, 48, 32),
+      (PRINT, 84, 32),
+      (PREV, 140, 32),
+      (PAGE_EDIT, 176, 46),
+      (NEXT, 226, 32),
+      (MINUS, 284, 32),
+      (PLUS, 320, 32),
+      (FIT, 364, 32),
+      (WIDTH, 400, 32),
+      (ROTATE, 436, 32),
+      (CONTINUOUS, 472, 32),
     ] {
-      self.place(id, x, 14, w, 32);
+      self.place(id, x, 10, w, 32);
     }
-    self.place(CONTINUOUS, 824, 14, 134, 32);
-    if wrapped {
-      self.place(FIT, 16, 58, 94, 32);
-      self.place(WIDTH, 118, 58, 112, 32);
-      self.place(ROTATE, 238, 58, 112, 32);
-      self.place(CONTINUOUS, 358, 58, 142, 32);
+    let tools_x = if wrapped { 12 } else { 536 };
+    let tools_y = if wrapped { 52 } else { 10 };
+    for (i, id) in [
+      editor::SELECT,
+      editor::MASK,
+      editor::COVER,
+      editor::MASK_SELECT,
+      editor::UNDO,
+      CANCEL,
+    ]
+    .iter()
+    .enumerate()
+    {
+      self.place(*id, tools_x + i as i32 * 36, tools_y, 32, 32);
     }
-    let top = self.layout_editor_bar(width, nav_top);
+    let top = if wrapped { 94 } else { 52 };
     self.toolbar_height = top;
-    self.place(TAB_PAGES, 12, top + 13, 107, 32);
-    self.place(TAB_LAYERS, 124, top + 13, 104, 32);
-    self.place(VIEW_MODE, 12, top + 54, 216, 120);
+    self.place(TAB_PAGES, 12, top + 10, 112, 32);
+    self.place(TAB_LAYERS, 128, top + 10, 100, 32);
+    self.place(VIEW_MODE, 12, top + 50, 216, 120);
     self.place(PAGE_LIST, 12, top + 96, 216, (height - top - 136).max(30));
     SendMessageW(
       self.control(PAGE_LIST),
@@ -453,7 +451,7 @@ impl App {
         TAB_PAGES | TAB_LAYERS | LAYER_NOTE => true,
         CANCEL => self.printing || self.editor.can_cancel(),
         editor::UNDO => loaded && self.editor.can_undo() && !self.printing,
-        editor::SAFE_SAVE => !self.editor.masks.is_empty() && !self.printing,
+        editor::SAVE => loaded && self.editor.dirty() && !self.printing,
         editor::SELECT | editor::MASK | editor::COVER | editor::MASK_SELECT => {
           loaded && !self.printing
         }
@@ -748,6 +746,16 @@ impl App {
       }
       plan.extend(details);
     }
+    // Видимые готовые изображения должны считаться недавно использованными.
+    // Иначе поступление соседней страницы вытесняет нужный кадр, который уже
+    // исключён из очереди рисования, и ожидание обновления не заканчивается.
+    for key in &plan {
+      if key.region.is_some() {
+        self.details.get(key);
+      } else {
+        self.frames.get(key);
+      }
+    }
     self.rendering = plan.iter().any(|key| self.cached(key).is_none());
     if plan != self.render_plan {
       self.ticket += 1;
@@ -963,7 +971,7 @@ impl App {
     if self.editor.busy && id != CANCEL {
       return;
     }
-    if (editor::PAGES..=editor::MASK_DELETE).contains(&id) {
+    if (editor::PAGES..=editor::SAVE_AS).contains(&id) {
       PostMessageW(self.hwnd, WM_APP + 21, id, 0);
       return;
     }
@@ -1114,7 +1122,12 @@ impl App {
           groups,
           warning,
         } if generation == self.generation => {
-          self.states = items.iter().map(|l| l.visible).collect();
+          self.states = self
+            .editor
+            .reload_states
+            .take()
+            .filter(|v| v.len() == items.len())
+            .unwrap_or_else(|| items.iter().map(|l| l.visible).collect());
           self.layers = items;
           self.groups = groups;
           self.refresh_layers();
@@ -1195,7 +1208,8 @@ impl App {
           self.layout();
           self.enable_controls();
           if self.closing {
-            PostQuitMessage(0);
+            self.closing = false;
+            PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
           }
         }
         _ => (),
@@ -1209,7 +1223,39 @@ impl App {
     let dc = target.unwrap_or_else(|| BeginPaint(self.hwnd, &mut ps));
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(self.hwnd, &mut r);
-    fill(dc, &r, 0x00fafafa);
+    fill(dc, &r, 0x00faf9f8);
+    for x in [128, 272, 352, 520] {
+      fill(
+        dc,
+        &RECT {
+          left: self.unit(x),
+          right: self.unit(x + 1),
+          top: self.unit(17),
+          bottom: self.unit(35),
+        },
+        0x00e4dfda,
+      );
+    }
+    if self.toolbar_height == 52 && !self.sizes.is_empty() {
+      text(
+        dc,
+        RECT {
+          left: self.unit(772),
+          right: r.right - self.unit(16),
+          top: self.unit(10),
+          bottom: self.unit(42),
+        },
+        &format!(
+          "{} / {}  ·  {:.0}%",
+          self.page + 1,
+          self.sizes.len(),
+          self.scale * 100.
+        ),
+        0x00857769,
+        self.font,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+      );
+    }
     fill(
       dc,
       &RECT {
@@ -1582,22 +1628,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     .flatten();
     if let Some(message) = message {
       crate::dialogs::prompt(hwnd, "Astra PDF", "Результат операции", &message, true);
-      with_app(|a| a.dialog_open = false);
+      with_app(|a| {
+        a.dialog_open = false;
+        a.continue_after_save();
+      });
     }
     return 0;
   }
   if msg == WM_CLOSE {
-    let pending = with_app(|a| !a.editor.masks.is_empty() && !a.editor.busy).unwrap_or(false);
-    if pending
-      && MessageBoxW(
-        hwnd,
-        wide("Метки скрытия не сохраняются при закрытии. Закрыть окно?").as_ptr(),
-        wide("Закрыть документ").as_ptr(),
-        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-      ) != IDYES
-    {
-      return 0;
-    }
+    editor::leave_document(hwnd, editor::AfterSave::Close);
+    return 0;
+  }
+  if msg == WM_DROPFILES {
+    let drop = wp as HDROP;
+    let size = DragQueryFileW(drop, 0, ptr::null_mut(), 0);
+    let mut value = vec![0u16; size as usize + 1];
+    DragQueryFileW(drop, 0, value.as_mut_ptr(), value.len() as u32);
+    DragFinish(drop);
+    use std::os::windows::ffi::OsStringExt;
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&value[..size as usize]));
+    editor::leave_document(hwnd, editor::AfterSave::Open(path));
+    return 0;
   }
   if msg == WM_APP + 14 {
     let message = with_app(|a| {
@@ -1636,27 +1687,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     .unwrap_or(false);
     if allowed {
       let result = App::choose_file(hwnd);
-      let discard = result.as_ref().is_ok_and(|p| p.is_some())
-        && with_app(|a| !a.editor.masks.is_empty()).unwrap_or(false);
-      if discard
-        && MessageBoxW(
-          hwnd,
-          wide("Метки скрытия текущего документа не сохранятся. Открыть другой документ?").as_ptr(),
-          wide("Открыть документ").as_ptr(),
-          MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-        ) != IDYES
-      {
-        with_app(|a| a.dialog_open = false);
-        return 0;
-      }
-      with_app(|a| {
-        a.dialog_open = false;
-        match result {
-          Ok(Some(path)) => a.open(path),
-          Err(e) => a.error(e),
-          _ => (),
+      with_app(|a| a.dialog_open = false);
+      match result {
+        Ok(Some(path)) => editor::leave_document(hwnd, editor::AfterSave::Open(path)),
+        Err(e) => {
+          with_app(|a| a.error(e));
         }
-      });
+        _ => (),
+      }
     }
     PostMessageW(hwnd, WM_APP + 14, 0, 0);
     return 0;
@@ -1959,21 +1997,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       }
       Some(0)
     }
-    WM_DROPFILES => {
-      let drop = wp as HDROP;
-      let size = DragQueryFileW(drop, 0, ptr::null_mut(), 0);
-      let mut value = vec![0u16; size as usize + 1];
-      DragQueryFileW(drop, 0, value.as_mut_ptr(), value.len() as u32);
-      DragFinish(drop);
-      if app.printing || app.editor.busy || !app.editor.masks.is_empty() {
-        return Some(0);
-      }
-      use std::os::windows::ffi::OsStringExt;
-      app.open(PathBuf::from(std::ffi::OsString::from_wide(
-        &value[..size as usize],
-      )));
-      Some(0)
-    }
     READY => {
       app.events();
       Some(0)
@@ -2001,17 +2024,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
     WM_TIMER if wp == 4 => {
       app.poll_job();
-      Some(0)
-    }
-    WM_CLOSE => {
-      app.cancel.store(true, Ordering::Relaxed);
-      if app.printing || app.editor.busy {
-        app.closing = true;
-        app.status = "Завершаю отмену печати…".into();
-        InvalidateRect(hwnd, ptr::null(), 0);
-      } else {
-        PostQuitMessage(0);
-      }
       Some(0)
     }
     _ => None,
@@ -2151,8 +2163,12 @@ unsafe fn hotkey(msg: &MSG) -> bool {
       a.action(CANCEL);
       return true;
     }
-    if key == VK_DELETE && !edit && a.editor.selection_is_mask() {
-      a.action(editor::MASK_DELETE);
+    if key == VK_DELETE && !edit {
+      a.action(if a.editor.selection_is_mask() {
+        editor::MASK_DELETE
+      } else {
+        editor::DELETE
+      });
       return true;
     }
     if !edit && canvas_focus && !ctrl {
@@ -2174,6 +2190,11 @@ unsafe fn hotkey(msg: &MSG) -> bool {
       match key {
         0x4f => Some(OPEN),
         0x50 => Some(PRINT),
+        0x53 => Some(if GetKeyState(VK_SHIFT as i32) < 0 {
+          editor::SAVE_AS
+        } else {
+          editor::SAVE
+        }),
         VK_OEM_PLUS | VK_ADD => Some(PLUS),
         VK_OEM_MINUS | VK_SUBTRACT => Some(MINUS),
         0x30 => Some(FIT),

@@ -90,7 +90,7 @@ def verify(exe, fixture, output):
     drag([.60, .55, .82, .70])
     committed = state()['masks']
     assert len(committed) == 2
-    button(45)
+    button(58)
     confirm = viewer.dialog()
     yes = next(v['hwnd'] for v in windows(parent=confirm['hwnd']) if v['id'] == 6 and v['class'] == 'Button')
     u.PostMessageW(yes, 0xf5, 0, 0)
@@ -151,10 +151,16 @@ def verify(exe, fixture, output):
     assert dialog['text'] == 'Изменить текст'
     u.PostMessageW(dialog['hwnd'], 0x100, 27, 0)
     wait(lambda: not viewer.snapshot()['dialog_open'])
+    generation = viewer.snapshot()['generation']
     button(43)
-    dialog = viewer.dialog()
-    viewer.dismiss(7)
-    checks.append('floating_actions_open_text_and_delete_dialogs')
+    viewer.ready(lambda s: s['generation'] > generation)
+    assert state()['document_dirty'] and not viewer.snapshot()['dialog_open']
+    generation = viewer.snapshot()['generation']
+    viewer.command(47)
+    viewer.ready(lambda s: s['generation'] > generation)
+    click(*center)
+    wait(lambda: not state()['busy'] and state()['selected_object'] is not None)
+    checks.append('floating_delete_is_immediate_and_undoable')
     viewer.command(15)
     for _ in range(200):
       send(canvas, 0x200, 0, point(*center))
@@ -192,7 +198,7 @@ def verify(exe, fixture, output):
       u.MoveWindow(viewer.hwnd, 30, 30, width, height, True)
       viewer.ready()
       rects = []
-      for identifier in [41, 44, 52, 56, 47, 45, 23]:
+      for identifier in [41, 44, 52, 56, 47, 58, 23]:
         r = w.RECT()
         u.GetWindowRect(control(identifier), c.byref(r))
         rects.append((r.left, r.top, r.right, r.bottom))

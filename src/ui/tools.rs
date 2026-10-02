@@ -1,5 +1,5 @@
 use super::*;
-use editor::{CHANGE_TEXT, COVER, DELETE, MASK, MASK_DELETE, MASK_SELECT, SAFE_SAVE, SELECT, UNDO};
+use editor::{CHANGE_TEXT, COVER, DELETE, MASK, MASK_DELETE, MASK_SELECT, SAVE, SELECT, UNDO};
 
 pub(super) const BAR: [(usize, &str); 7] = [
   (SELECT, "Объект"),
@@ -7,7 +7,7 @@ pub(super) const BAR: [(usize, &str); 7] = [
   (COVER, "Скрыть"),
   (MASK_SELECT, "Блоки"),
   (UNDO, "Назад"),
-  (SAFE_SAVE, "Сохранить"),
+  (SAVE, "Сохранить"),
   (CANCEL, "Esc"),
 ];
 pub(super) const ACTIONS: [(usize, &str); 3] = [
@@ -16,8 +16,83 @@ pub(super) const ACTIONS: [(usize, &str); 3] = [
   (MASK_DELETE, "Убрать блок"),
 ];
 
+pub(super) const NAV: [(usize, &str); 13] = [
+  (OPEN, "Открыть PDF · Ctrl+O"),
+  (PRINT, "Печать · Ctrl+P"),
+  (PREV, "Предыдущая страница"),
+  (NEXT, "Следующая страница"),
+  (MINUS, "Уменьшить · Ctrl+−"),
+  (PLUS, "Увеличить · Ctrl++"),
+  (FIT, "Страница целиком · Ctrl+0"),
+  (WIDTH, "По ширине · Ctrl+2"),
+  (ROTATE, "Повернуть · Ctrl+R"),
+  (CONTINUOUS, "Непрерывная прокрутка"),
+  (TAB_PAGES, "Страницы"),
+  (TAB_LAYERS, "Слои"),
+  (RESET, "Сбросить слои"),
+];
+
 pub(super) fn is_button(id: usize) -> bool {
-  BAR.iter().chain(ACTIONS.iter()).any(|(i, _)| *i == id)
+  BAR
+    .iter()
+    .chain(ACTIONS.iter())
+    .chain(NAV.iter())
+    .any(|(i, _)| *i == id)
+}
+
+unsafe extern "system" fn button_proc(
+  hwnd: HWND,
+  msg: u32,
+  wp: WPARAM,
+  lp: LPARAM,
+  _: usize,
+  _: usize,
+) -> LRESULT {
+  let name = wide("AstraHover");
+  if msg == WM_MOUSEMOVE && GetPropW(hwnd, name.as_ptr()).is_null() {
+    SetPropW(hwnd, name.as_ptr(), 1usize as _);
+    let mut tracking = TRACKMOUSEEVENT {
+      cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+      dwFlags: TME_LEAVE,
+      hwndTrack: hwnd,
+      dwHoverTime: 0,
+    };
+    TrackMouseEvent(&mut tracking);
+    InvalidateRect(hwnd, ptr::null(), 0);
+  } else if msg == WM_MOUSELEAVE || msg == WM_NCDESTROY {
+    RemovePropW(hwnd, name.as_ptr());
+    InvalidateRect(hwnd, ptr::null(), 0);
+  }
+  DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+fn icon(id: usize) -> &'static [u8] {
+  match id {
+    10 => include_bytes!("../../assets/lucide/folder-open.png"),
+    11 => include_bytes!("../../assets/lucide/printer.png"),
+    12 => include_bytes!("../../assets/lucide/chevron-left.png"),
+    13 => include_bytes!("../../assets/lucide/chevron-right.png"),
+    14 => include_bytes!("../../assets/lucide/minus.png"),
+    15 => include_bytes!("../../assets/lucide/plus.png"),
+    16 => include_bytes!("../../assets/lucide/scan.png"),
+    17 => include_bytes!("../../assets/lucide/move-horizontal.png"),
+    18 => include_bytes!("../../assets/lucide/rotate-cw.png"),
+    27 => include_bytes!("../../assets/lucide/scroll.png"),
+    41 => include_bytes!("../../assets/lucide/mouse-pointer-2.png"),
+    44 => include_bytes!("../../assets/lucide/grid-3x3.png"),
+    52 => include_bytes!("../../assets/lucide/shield.png"),
+    56 => include_bytes!("../../assets/lucide/scan-line.png"),
+    47 => include_bytes!("../../assets/lucide/undo-2.png"),
+    58 => include_bytes!("../../assets/lucide/save.png"),
+    23 => include_bytes!("../../assets/lucide/x.png"),
+    42 => include_bytes!("../../assets/lucide/text-cursor-input.png"),
+    43 => include_bytes!("../../assets/lucide/trash.png"),
+    57 => include_bytes!("../../assets/lucide/trash.png"),
+    24 => include_bytes!("../../assets/lucide/files.png"),
+    25 => include_bytes!("../../assets/lucide/layers.png"),
+    22 => include_bytes!("../../assets/lucide/rotate-ccw.png"),
+    _ => &[],
+  }
 }
 
 impl App {
@@ -43,20 +118,21 @@ impl App {
       GetModuleHandleW(ptr::null()),
       ptr::null(),
     );
-    for (id, label) in [
-      (SELECT, "Выбрать объект PDF: текст, изображение или контур"),
-      (MASK, "Пикселизация: выделить область мышью"),
-      (COVER, "Полное скрытие: выделить область мышью"),
-      (MASK_SELECT, "Выбрать скрывающий блок и убрать его"),
-      (UNDO, "Отменить последнее действие · Ctrl+Z"),
-      (SAFE_SAVE, "Сохранить PDF с отмеченными областями"),
+    for (id, label) in NAV.into_iter().chain([
+      (SELECT, "Выбрать объект PDF"),
+      (MASK, "Пикселизация области"),
+      (COVER, "Полное скрытие области"),
+      (MASK_SELECT, "Выбрать скрывающий блок"),
+      (UNDO, "Отменить действие · Ctrl+Z"),
+      (SAVE, "Сохранить · Ctrl+S"),
       (CANCEL, "Выключить инструмент / отменить операцию · Esc"),
-      (CHANGE_TEXT, "Изменить выбранный текст"),
-      (DELETE, "Удалить выбранный объект"),
-      (MASK_DELETE, "Убрать выбранный блок · Delete"),
-    ] {
+      (CHANGE_TEXT, "Изменить текст"),
+      (DELETE, "Удалить объект · Delete"),
+      (MASK_DELETE, "Убрать блок · Delete"),
+    ]) {
       self.tool_labels.push(wide(label));
       let h = self.control(id);
+      SetWindowSubclass(h, Some(button_proc), 1, 0);
       let info = TTTOOLINFOW {
         cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
         uFlags: TTF_IDISHWND | TTF_SUBCLASS,
@@ -69,49 +145,37 @@ impl App {
     }
   }
 
-  pub(super) unsafe fn layout_editor_bar(&self, width: i32, top: i32) -> i32 {
-    let button_width = if width >= 880 { 112 } else { 44 };
-    for (i, (id, _)) in BAR.iter().enumerate() {
-      self.place(
-        *id,
-        12 + i as i32 * (button_width + 8),
-        top + 2,
-        button_width,
-        36,
-      );
-    }
-    top + 46
-  }
-
   pub(super) unsafe fn paint_editor_button(&self, item: &DRAWITEMSTRUCT) {
     let id = item.CtlID as usize;
-    let active = self.editor.active(id);
+    let active = self.editor.active(id)
+      || (id == CONTINUOUS && self.continuous)
+      || (id == TAB_PAGES && !self.layer_tab)
+      || (id == TAB_LAYERS && self.layer_tab);
     let disabled = item.itemState & ODS_DISABLED != 0;
     let pressed = item.itemState & ODS_SELECTED != 0;
+    let hover = !GetPropW(item.hwndItem, wide("AstraHover").as_ptr()).is_null();
     let background = if active {
       0x00f2decb
-    } else if pressed {
-      0x00e9e3da
+    } else if !disabled && pressed {
+      0x00e5d9ca
+    } else if !disabled && hover {
+      0x00eeebe7
     } else {
-      0x00ffffff
+      0x00faf9f8
     };
     let foreground = if disabled {
-      0x00b5b1ab
+      0x00b5aea7
     } else if active {
-      0x00905a16
+      0x00a36519
     } else {
-      0x00534535
+      0x005a4b3b
     };
     let dc = item.hDC;
     let r = item.rcItem;
-    fill(dc, &r, background);
-    let pen = CreatePen(
-      PS_SOLID,
-      self.unit(if active { 2 } else { 1 }),
-      if active { 0x00c87818 } else { 0x00ddd7d0 },
-    );
-    let old_pen = SelectObject(dc, pen);
-    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    fill(dc, &r, 0x00faf9f8);
+    let brush = CreateSolidBrush(background);
+    let old_brush = SelectObject(dc, brush);
+    let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
     RoundRect(
       dc,
       r.left,
@@ -121,144 +185,92 @@ impl App {
       self.unit(8),
       self.unit(8),
     );
+    SelectObject(dc, old_brush);
     SelectObject(dc, old_pen);
-    DeleteObject(pen);
-    let with_label = r.right - r.left >= self.unit(80);
-    let x = if with_label {
+    DeleteObject(brush);
+    let labelled = matches!(
+      id,
+      TAB_PAGES | TAB_LAYERS | RESET | CHANGE_TEXT | DELETE | MASK_DELETE
+    );
+    let size = self.unit(20);
+    let x = if labelled {
       r.left + self.unit(10)
     } else {
-      (r.left + r.right - self.unit(20)) / 2
+      (r.left + r.right - size) / 2
     };
-    let y = r.top + self.unit(7);
-    let pen = CreatePen(PS_SOLID, self.unit(2).max(1), foreground);
-    let old_pen = SelectObject(dc, pen);
-    let line = |points: &[(i32, i32)]| {
-      let points: Vec<_> = points
+    let y = (r.top + r.bottom - size) / 2;
+    // PNG содержат только альфа-канал официальной геометрии Lucide. Цвет задаётся темой кнопки.
+    static ICONS: std::sync::OnceLock<std::collections::HashMap<usize, Vec<u8>>> =
+      std::sync::OnceLock::new();
+    let icons = ICONS.get_or_init(|| {
+      NAV
         .iter()
-        .map(|(a, b)| POINT {
-          x: x + self.unit(*a),
-          y: y + self.unit(*b),
+        .chain(BAR.iter())
+        .chain(ACTIONS.iter())
+        .map(|(id, _)| {
+          let mut reader = png::Decoder::new(std::io::Cursor::new(icon(*id)))
+            .read_info()
+            .expect("Встроенная иконка");
+          let mut pixels = vec![0; reader.output_buffer_size()];
+          let info = reader.next_frame(&mut pixels).expect("Встроенная иконка");
+          assert_eq!(info.color_type, png::ColorType::Rgba);
+          (
+            *id,
+            pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
+          )
+        })
+        .collect()
+    });
+    if let Some(alpha) = icons.get(&id) {
+      let pixels: Vec<u8> = alpha
+        .iter()
+        .flat_map(|a| {
+          let mut p = [0u8; 4];
+          for (i, shift) in [16, 8, 0].iter().enumerate() {
+            p[i] = (((foreground >> shift) & 255) * u32::from(*a)
+              + ((background >> shift) & 255) * (255 - u32::from(*a)))
+            .div_ceil(255) as u8;
+          }
+          p[3] = 255;
+          p
         })
         .collect();
-      Polyline(dc, points.as_ptr(), points.len() as i32);
-    };
-    match id {
-      SELECT => {
-        line(&[
-          (2, 1),
-          (2, 18),
-          (7, 13),
-          (11, 20),
-          (14, 18),
-          (10, 11),
-          (17, 11),
-          (2, 1),
-        ]);
-      }
-      MASK => {
-        for row in 0..3 {
-          for col in 0..3 {
-            let r = RECT {
-              left: x + self.unit(col * 7),
-              top: y + self.unit(row * 7),
-              right: x + self.unit(col * 7 + 5),
-              bottom: y + self.unit(row * 7 + 5),
-            };
-            fill(
-              dc,
-              &r,
-              if (row + col) % 2 == 0 {
-                foreground
-              } else {
-                0x00c8bbaa
-              },
-            );
-          }
-        }
-      }
-      COVER => {
-        fill(
-          dc,
-          &RECT {
-            left: x,
-            top: y + self.unit(3),
-            right: x + self.unit(20),
-            bottom: y + self.unit(17),
-          },
-          foreground,
-        );
-      }
-      MASK_SELECT => {
-        line(&[(0, 7), (0, 0), (7, 0)]);
-        line(&[(13, 0), (20, 0), (20, 7)]);
-        line(&[(20, 13), (20, 20), (13, 20)]);
-        line(&[(7, 20), (0, 20), (0, 13)]);
-        line(&[(7, 7), (7, 16), (16, 7), (7, 7)]);
-      }
-      UNDO => {
-        line(&[(8, 2), (1, 8), (8, 14)]);
-        line(&[(2, 8), (14, 8), (19, 12), (19, 18), (11, 18)]);
-      }
-      SAFE_SAVE => {
-        line(&[(1, 1), (16, 1), (20, 5), (20, 20), (1, 20), (1, 1)]);
-        line(&[(6, 1), (6, 7), (15, 7), (15, 1)]);
-        line(&[(6, 20), (6, 13), (15, 13), (15, 20)]);
-      }
-      CHANGE_TEXT => {
-        line(&[(3, 3), (17, 3)]);
-        line(&[(10, 3), (10, 18)]);
-        line(&[(5, 18), (15, 18)]);
-      }
-      DELETE | MASK_DELETE => {
-        line(&[(2, 5), (18, 5)]);
-        line(&[(6, 5), (6, 1), (14, 1), (14, 5)]);
-        line(&[(4, 5), (5, 20), (15, 20), (16, 5)]);
-        line(&[(8, 9), (8, 16)]);
-        line(&[(12, 9), (12, 16)]);
-      }
-      CANCEL => {
-        line(&[(3, 3), (17, 17)]);
-        line(&[(17, 3), (3, 17)]);
-      }
-      _ => (),
-    }
-    SelectObject(dc, old_pen);
-    SelectObject(dc, old_brush);
-    DeleteObject(pen);
-    let label = BAR
-      .iter()
-      .chain(ACTIONS.iter())
-      .find(|(i, _)| *i == id)
-      .map_or("", |(_, s)| *s);
-    let label = if id == CANCEL && (self.printing || self.editor.busy) {
-      "Стоп"
-    } else {
-      label
-    };
-    if with_label {
-      let label_rect = RECT {
-        left: x + self.unit(27),
-        top: r.top,
-        right: r.right - self.unit(4),
-        bottom: r.bottom,
+      let raster = Raster {
+        width: 80,
+        height: 80,
+        pixels: Arc::new(pixels),
       };
+      printing::draw_raster(dc, &raster, x, y, size, size);
+    }
+    if labelled {
+      let label = NAV
+        .iter()
+        .chain(ACTIONS.iter())
+        .find(|(i, _)| *i == id)
+        .map_or("", |(_, label)| *label);
       text(
         dc,
-        label_rect,
+        RECT {
+          left: x + size + self.unit(7),
+          right: r.right - self.unit(6),
+          ..r
+        },
         label,
         foreground,
         self.font,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
       );
     }
     if item.itemState & ODS_FOCUS != 0 {
-      let focus = RECT {
-        left: r.left + self.unit(3),
-        top: r.top + self.unit(3),
-        right: r.right - self.unit(3),
-        bottom: r.bottom - self.unit(3),
-      };
-      DrawFocusRect(dc, &focus);
+      DrawFocusRect(
+        dc,
+        &RECT {
+          left: r.left + 3,
+          top: r.top + 3,
+          right: r.right - 3,
+          bottom: r.bottom - 3,
+        },
+      );
     }
   }
 }

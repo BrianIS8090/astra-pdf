@@ -8,6 +8,7 @@ Copy-Item "$projectRoot\target\release\astra-pdf.exe" "$outputDir\AstraPDF.exe"
 Copy-Item "$projectRoot\vendor\pdfium\bin\pdfium.dll" $outputDir
 Copy-Item "$projectRoot\vendor\pdfium\LICENSE" "$outputDir\PDFium-LICENSE.txt"
 Copy-Item "$projectRoot\vendor\pdfium\licenses" "$outputDir\licenses" -Recurse
+Copy-Item "$projectRoot\assets\lucide\LICENSE.txt" "$outputDir\licenses\Lucide-LICENSE.txt"
 Copy-Item "$projectRoot\LICENSE" "$outputDir\LICENSE.txt"
 Copy-Item "$projectRoot\README.md" $outputDir
 Copy-Item "$projectRoot\CHANGELOG.md" $outputDir

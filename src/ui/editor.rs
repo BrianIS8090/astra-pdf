@@ -3,7 +3,9 @@ use crate::{
   dialogs,
   editing::{Mask, MaskKind, Operation, PageObject},
   engine::Client,
-  export, vault,
+  export,
+  session::{self, Revision, Session},
+  vault,
 };
 use std::{path::Path, sync::mpsc};
 
@@ -25,6 +27,13 @@ const PIXEL_MEDIUM: usize = 54;
 pub const PIXEL_LARGE: usize = 55;
 pub(super) const MASK_SELECT: usize = 56;
 pub(super) const MASK_DELETE: usize = 57;
+pub(super) const SAVE: usize = 58;
+pub(super) const SAVE_AS: usize = 59;
+
+pub(super) enum AfterSave {
+  Close,
+  Open(PathBuf),
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Mode {
@@ -38,6 +47,8 @@ enum Mode {
 enum MaskUndo {
   Added(usize),
   Removed(usize, Mask),
+  Document(Arc<Revision>),
+  Masks(Vec<Mask>),
 }
 enum ResultItem {
   Objects {
@@ -45,10 +56,15 @@ enum ResultItem {
     point: (f64, f64),
     objects: Vec<PageObject>,
   },
-  Copy {
-    path: PathBuf,
-    previous: PathBuf,
+  Edited {
+    before: Arc<Revision>,
+    after: Arc<Revision>,
   },
+  Saved {
+    path: PathBuf,
+    hash: [u8; 32],
+  },
+  Cleaned(String),
   Info(String),
 }
 enum JobMessage {
@@ -66,7 +82,9 @@ pub(super) struct Editor {
   drag: Option<Mask>,
   start: Option<(f64, f64)>,
   selected: Option<(usize, PageObject)>,
-  undo: Vec<PathBuf>,
+  session: Option<Session>,
+  pub after_save: Option<AfterSave>,
+  pub reload_states: Option<Vec<bool>>,
   receiver: Option<mpsc::Receiver<JobMessage>>,
   pub notice: Option<String>,
   pixel_mm: u8,
@@ -78,6 +96,9 @@ impl Editor {
   pub(super) fn probe(&self) -> serde_json::Value {
     serde_json::json!({
       "masks": self.masks,
+      "dirty": self.dirty(),
+      "document_dirty": self.session.as_ref().is_some_and(Session::dirty),
+      "undo_count": self.mask_undo.len(),
       "mode": format!("{:?}", self.mode),
       "selected_mask": self.selected_mask,
       "selected_object": self.selected.as_ref().map(|(p, o)| serde_json::json!({"page":p,"index":o.index,"kind":o.kind,"bounds":o.bounds})),
@@ -104,6 +125,9 @@ impl Editor {
   }
 
   fn undo_mask(&mut self) -> bool {
+    if matches!(self.mask_undo.last(), Some(MaskUndo::Document(_))) {
+      return false;
+    }
     let Some(change) = self.mask_undo.pop() else {
       return false;
     };
@@ -112,6 +136,8 @@ impl Editor {
         self.masks.remove(index);
       }
       MaskUndo::Removed(index, mask) => self.masks.insert(index, mask),
+      MaskUndo::Masks(masks) => self.masks = masks,
+      MaskUndo::Document(_) => unreachable!(),
     }
     self.selected_mask = None;
     true
@@ -144,7 +170,26 @@ impl Editor {
   }
 
   pub(super) fn can_undo(&self) -> bool {
-    !self.mask_undo.is_empty() || !self.undo.is_empty()
+    !self.mask_undo.is_empty()
+  }
+
+  pub(super) fn dirty(&self) -> bool {
+    !self.masks.is_empty() || self.session.as_ref().is_some_and(Session::dirty)
+  }
+
+  fn trim_history(&mut self) {
+    let mut bytes = 0;
+    let mut keep = self.mask_undo.len();
+    for item in self.mask_undo.iter().rev().take(100) {
+      if let MaskUndo::Document(r) = item {
+        bytes += r.size;
+      }
+      if bytes > 256 * 1024 * 1024 {
+        break;
+      }
+      keep -= 1;
+    }
+    self.mask_undo.drain(..keep);
   }
 
   pub(super) fn selection_is_mask(&self) -> bool {
@@ -170,6 +215,8 @@ pub(super) unsafe fn menu(hwnd: HWND) {
       "Файл",
       vec![
         (OPEN, "Открыть…\tCtrl+O"),
+        (SAVE, "Сохранить\tCtrl+S"),
+        (SAVE_AS, "Сохранить как…\tCtrl+Shift+S"),
         (PAGES, "Сохранить отдельные страницы…"),
         (PRINT, "Печать…\tCtrl+P"),
       ],
@@ -225,6 +272,55 @@ pub(super) unsafe fn menu(hwnd: HWND) {
 }
 
 impl App {
+  pub(super) fn document_path(&self) -> Option<PathBuf> {
+    self
+      .editor
+      .session
+      .as_ref()
+      .map(|s| s.current.path.clone())
+      .or_else(|| self.path.clone())
+  }
+
+  pub(super) unsafe fn update_title(&self) {
+    if let Some(path) = &self.path {
+      let title = format!(
+        "{}{} — {}",
+        if self.editor.dirty() { "* " } else { "" },
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        crate::version::title()
+      );
+      SetWindowTextW(self.hwnd, wide(&title).as_ptr());
+    }
+  }
+
+  unsafe fn reload_revision(&mut self) {
+    let Some(path) = self.document_path() else {
+      return;
+    };
+    let logical = self.path.clone();
+    let mut editor = std::mem::take(&mut self.editor);
+    editor.selected = None;
+    editor.grids = None;
+    editor.mosaic_plan.clear();
+    editor.reload_states = Some(self.states.clone());
+    let (page, zoom, rotation, scroll) = (self.page, self.zoom, self.rotation, self.scroll);
+    self.open(path);
+    self.path = logical;
+    self.editor = editor;
+    self.page = page;
+    self.zoom = zoom;
+    self.rotation = rotation;
+    self.scroll = scroll;
+    self.update_title();
+  }
+
+  pub(super) unsafe fn continue_after_save(&mut self) {
+    match self.editor.after_save.take() {
+      Some(AfterSave::Close) => PostQuitMessage(0),
+      Some(AfterSave::Open(path)) => self.open(path),
+      None => (),
+    }
+  }
   pub(super) unsafe fn cancel_editor(&mut self) {
     self.editor.stop_tool();
     ReleaseCapture();
@@ -242,8 +338,9 @@ impl App {
   }
 
   pub(super) unsafe fn sync_editor_controls(&self) {
+    self.update_title();
     self.enable_controls();
-    for id in [SELECT, MASK, COVER, MASK_SELECT, UNDO, SAFE_SAVE, CANCEL] {
+    for id in [SELECT, MASK, COVER, MASK_SELECT, UNDO, SAVE, CANCEL] {
       CheckMenuItem(
         GetMenu(self.hwnd),
         id as u32,
@@ -434,14 +531,32 @@ impl App {
               self.status = "Сохранено".into();
               self.notice(message);
             }
-            Ok(ResultItem::Copy { path, previous }) => {
-              let mut undo = std::mem::take(&mut self.editor.undo);
-              undo.push(previous);
-              let page = self.page;
-              self.open(path);
-              self.page = page;
-              self.editor.undo = undo;
-              self.editor.mode = Mode::Select;
+            Ok(ResultItem::Edited { before, after }) => {
+              let saved_hash = self
+                .editor
+                .session
+                .as_ref()
+                .map_or(before.hash, |s| s.saved_hash);
+              self.editor.mask_undo.push(MaskUndo::Document(before));
+              self.editor.trim_history();
+              self.editor.session = Some(Session {
+                current: after,
+                saved_hash,
+              });
+              self.reload_revision();
+              self.status = "Изменено · Ctrl+Z — отменить · Ctrl+S — сохранить".into();
+            }
+            Ok(ResultItem::Saved { path, hash }) => {
+              self.path = Some(path);
+              if let Some(session) = &mut self.editor.session {
+                session.saved_hash = hash;
+              }
+              self.status = "Сохранено".into();
+              self.continue_after_save();
+            }
+            Ok(ResultItem::Cleaned(message)) => {
+              self.status = "Очищенный PDF сохранён".into();
+              self.notice(message);
             }
             Ok(ResultItem::Objects {
               page,
@@ -452,7 +567,8 @@ impl App {
                 self.status = "Выбор объекта отменён.".into();
                 self.sync_editor_controls();
                 if self.closing {
-                  PostQuitMessage(0);
+                  self.closing = false;
+                  PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
                 }
                 continue;
               }
@@ -490,6 +606,7 @@ impl App {
               };
             }
             Err(error) => {
+              self.editor.after_save = None;
               self.status = error.clone();
               if !self.cancel.load(Ordering::Relaxed) {
                 self.notice(error);
@@ -497,7 +614,8 @@ impl App {
             }
           }
           if self.closing {
-            PostQuitMessage(0);
+            self.closing = false;
+            PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
           }
           self.sync_editor_controls();
         }
@@ -602,7 +720,7 @@ impl App {
         let Some(fingerprint) = self.editor.fingerprint else {
           return;
         };
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.document_path() else {
           return;
         };
         self.editor.selected_mask = None;
@@ -838,7 +956,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
       dialogs::prompt(
         hwnd,
         "Редактирование и скрытие",
-        "Исходный файл остаётся неизменным.",
+        "Правки сохраняются по Ctrl+S. Ctrl+Z — отмена.",
         include_str!("../../docs/EDITING.txt"),
         true,
       );
@@ -852,7 +970,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
   }
   let (path, page, count, selected, masks, states, fingerprint) = with_app(|a| {
     (
-      a.path.clone(),
+      a.document_path(),
       a.page,
       a.sizes.len(),
       a.editor.selected.clone(),
@@ -863,6 +981,12 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
   })
   .ok_or("Окно закрыто.")?;
   let path = path.ok_or("Сначала откройте PDF.")?;
+  let logical = with_app(|a| a.path.clone())
+    .flatten()
+    .ok_or("Сначала откройте PDF.")?;
+  if matches!(id, SAVE | SAVE_AS) {
+    return save_document(hwnd, id == SAVE_AS);
+  }
   let fingerprint = fingerprint.ok_or("Дождитесь загрузки документа.")?;
   if count == 0 {
     return Err("Дождитесь загрузки документа.".into());
@@ -917,6 +1041,16 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
       }
       with_app(|a| {
         a.editor.pixel_mm = block_mm;
+        if a
+          .editor
+          .masks
+          .iter()
+          .any(|m| matches!(m.kind, MaskKind::Pixelate { block_mm: old } if old != block_mm))
+        {
+          a.editor
+            .mask_undo
+            .push(MaskUndo::Masks(a.editor.masks.clone()));
+        }
         for mask in &mut a.editor.masks {
           if matches!(mask.kind, MaskKind::Pixelate { .. }) {
             mask.kind = MaskKind::Pixelate { block_mm };
@@ -940,13 +1074,15 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
         if a.editor.undo_mask() {
           a.status = "Последнее изменение скрывающих блоков отменено.".into();
           InvalidateRect(a.canvas, ptr::null(), 0);
-        } else if let Some(previous) = a.editor.undo.pop() {
-          let undo = std::mem::take(&mut a.editor.undo);
-          a.open(previous);
-          a.editor.undo = undo;
+        } else if let Some(MaskUndo::Document(previous)) = a.editor.mask_undo.pop() {
+          if let Some(session) = &mut a.editor.session {
+            session.current = previous;
+          }
+          a.reload_revision();
         } else {
           a.status = "Нет действий для отмены.".into();
         }
+        a.request_mosaics();
       });
     }
     MASK_DELETE => {
@@ -961,7 +1097,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     PAGES => {
       let Some(range) = dialogs::prompt(hwnd,"Сохранить страницы",&format!("Всего страниц: {count}. Введите номера или диапазоны, например: 1, 3-5.\nПорядок как в исходнике; без повторов. Сохраняются исходные слои."),&(page+1).to_string(),false) else { return Ok(()); };
       let pages = crate::editing::pages(&range, count)?;
-      let Some(output) = output_pdf(hwnd, &path, "Сохранить выбранные страницы", "страницы")?
+      let Some(output) = output_pdf(hwnd, &logical, "Сохранить выбранные страницы", "страницы")?
       else {
         return Ok(());
       };
@@ -984,35 +1120,44 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
           return Err("Выбран не текстовый объект. В сканах текст является частью изображения; вложенные группы пока редактируются целиком.".into());
         }
         let Some(text)=dialogs::prompt(hwnd,"Изменить текст","Замена одной строки шрифтом Arial. Размер, положение и цвет сохраняются.\nПеренос строк и исходное начертание не сохраняются. Проверьте результат перед отправкой.",&object.text,false) else { return Ok(()); };
+        if text == object.text {
+          return Ok(());
+        }
         Operation::Text {
           page,
           object: object.index,
           text,
         }
       } else {
-        if MessageBoxW(hwnd,wide(&format!("Удалить: {}?\nБудет сохранена новая копия. Это обычное редактирование; для конфиденциальных данных используйте защищённое скрытие.",kind_name(object.kind))).as_ptr(),wide("Удаление объекта").as_ptr(),MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES { return Ok(()); }
         Operation::Delete {
           page,
           object: object.index,
         }
       };
-      let Some(output) = output_pdf(hwnd, &path, "Сохранить изменённую копию", "правка")?
-      else {
-        return Ok(());
-      };
+      let previous = with_app(|a| a.editor.session.as_ref().map(|s| s.current.clone())).flatten();
       with_app(|a| {
         a.job(move |cancel, _| {
+          let before = if let Some(previous) = previous {
+            previous
+          } else {
+            let original = export::read(&path, vault::LIMIT)?;
+            let revision = Revision::new(&original)?;
+            if revision.hash != fingerprint {
+              return Err("Исходный файл изменился. Откройте его повторно.".into());
+            }
+            revision
+          };
           let mut client = Client::spawn(&crate::pdfium_path())?;
           client.open_checked(&path, fingerprint, || cancel.load(Ordering::Relaxed))?;
           let bytes = client.edit(operation, || cancel.load(Ordering::Relaxed))?;
           if cancel.load(Ordering::Relaxed) {
             return Err("Изменение отменено.".into());
           }
-          export::write(&output, &bytes)?;
-          Ok(ResultItem::Copy {
-            path: output,
-            previous: path,
-          })
+          let after = Revision::new(&bytes)?;
+          if cancel.load(Ordering::Relaxed) {
+            return Err("Изменение отменено.".into());
+          }
+          Ok(ResultItem::Edited { before, after })
         })
       });
     }
@@ -1040,7 +1185,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
       }
       let Some(output) = output_pdf(
         hwnd,
-        &path,
+        &logical,
         "PDF для заказчика — очищенная копия",
         "очищено",
       )?
@@ -1065,7 +1210,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
         export::write(&key_path,&key)?;
         export::write(&vault_path,&encrypted)?;
         export::clean_pdf(|key|client.render(key,false,||cancel.load(Ordering::Relaxed)),&meta.sizes,&states,&masks,&output,||cancel.load(Ordering::Relaxed),|done,total| { let _=progress.send(JobMessage::Progress(done,total)); })?;
-        Ok(ResultItem::Info(format!("Для заказчика:\n{}\n\nЗащищённый оригинал (сохраните у себя):\n{}\n\nКлюч восстановления (не отправляйте заказчику):\n{}\n\nБез ключа восстановление невозможно. Сделайте отдельную резервную копию ключа. Меню «Восстановить оригинал по ключу» вернёт исходный PDF.",output.display(),vault_path.display(),key_path.display())))
+        Ok(ResultItem::Cleaned(format!("Для заказчика:\n{}\n\nЗащищённый оригинал (сохраните у себя):\n{}\n\nКлюч восстановления (не отправляйте заказчику):\n{}\n\nБез ключа восстановление невозможно. Сделайте отдельную резервную копию ключа. Меню «Восстановить оригинал по ключу» вернёт исходный PDF.",output.display(),vault_path.display(),key_path.display())))
       })
       });
     }
@@ -1080,6 +1225,108 @@ fn private_dir() -> Result<PathBuf, String> {
       .join("AstraPDF")
       .join("Private"),
   )
+}
+
+unsafe fn save_document(hwnd: HWND, save_as: bool) -> Result<(), String> {
+  let (logical, source, expected, masks) = with_app(|a| {
+    (
+      a.path.clone(),
+      a.document_path(),
+      a.editor
+        .session
+        .as_ref()
+        .map(|s| s.saved_hash)
+        .or(a.editor.fingerprint),
+      !a.editor.masks.is_empty(),
+    )
+  })
+  .ok_or("Окно закрыто.")?;
+  if masks {
+    return command_inner(hwnd, SAFE_SAVE);
+  }
+  let logical = logical.ok_or("Сначала откройте PDF.")?;
+  let source = source.ok_or("Сначала откройте PDF.")?;
+  let expected = expected.ok_or("Дождитесь загрузки документа.")?;
+  let destination = if save_as {
+    let Some(path) = dialogs::file(hwnd, "Сохранить как", "pdf", &logical, true) else {
+      return Ok(());
+    };
+    path
+  } else {
+    logical.clone()
+  };
+  let expected = if export::same_file(&destination, &logical) {
+    Some(expected)
+  } else if destination.exists() {
+    Some(session::hash_file(&destination)?)
+  } else {
+    None
+  };
+  with_app(|a| {
+    a.job(move |cancel, _| {
+      let hash = session::save(&source, &destination, expected, || {
+        cancel.load(Ordering::Relaxed)
+      })?;
+      Ok(ResultItem::Saved {
+        path: destination,
+        hash,
+      })
+    })
+  });
+  Ok(())
+}
+
+pub(super) unsafe fn leave_document(hwnd: HWND, next: AfterSave) {
+  let allowed = with_app(|a| {
+    if a.dialog_open {
+      return false;
+    }
+    if a.editor.busy || a.printing {
+      if matches!(next, AfterSave::Close) {
+        a.closing = true;
+        a.cancel.store(true, Ordering::Relaxed);
+      }
+      return false;
+    }
+    a.dialog_open = true;
+    true
+  })
+  .unwrap_or(false);
+  if !allowed {
+    return;
+  }
+  let dirty = with_app(|a| a.editor.dirty()).unwrap_or(false);
+  let answer = if dirty {
+    let masks = with_app(|a| !a.editor.masks.is_empty()).unwrap_or(false);
+    MessageBoxW(hwnd, wide(if masks {
+      "Сохранить изменения перед закрытием документа?\nОбласти скрытия будут сохранены отдельным очищенным PDF.\n\nДа — сохранить; Нет — не сохранять; Отмена — продолжить работу."
+    } else {
+      "Сохранить изменения перед закрытием документа?\n\nДа — сохранить; Нет — не сохранять; Отмена — продолжить работу."
+    }).as_ptr(), wide("Несохранённые изменения").as_ptr(), MB_YESNOCANCEL | MB_ICONQUESTION)
+  } else {
+    IDNO
+  };
+  if answer == IDYES {
+    with_app(|a| a.editor.after_save = Some(next));
+    let result = save_document(hwnd, false);
+    with_app(|a| {
+      if let Err(e) = result {
+        a.notice(e);
+      }
+      if !a.editor.busy {
+        a.editor.after_save = None;
+      }
+    });
+  } else if answer == IDNO {
+    with_app(|a| {
+      a.editor.after_save = Some(next);
+      a.continue_after_save();
+    });
+  }
+  with_app(|a| {
+    a.dialog_open = false;
+    a.sync_editor_controls();
+  });
 }
 
 unsafe fn output_pdf(
@@ -1201,6 +1448,25 @@ mod tests {
     assert_eq!(editor.mode, Mode::View);
     assert!(editor.drag.is_none() && editor.start.is_none() && editor.selected_mask.is_none());
     assert!(!editor.can_cancel());
+    assert_eq!(editor.masks.len(), 1);
+    assert!(editor.undo_mask());
+    assert!(editor.masks.is_empty());
+  }
+
+  #[test]
+  fn document_and_mask_undo_follow_actual_order() {
+    let revision = Revision::new(b"test revision").unwrap();
+    let mut editor = Editor::default();
+    editor.add_mask(mask(0.1));
+    editor.selected_mask = Some(0);
+    editor.remove_mask();
+    editor.mask_undo.push(MaskUndo::Document(revision));
+    assert!(!editor.undo_mask());
+    assert!(matches!(
+      editor.mask_undo.pop(),
+      Some(MaskUndo::Document(_))
+    ));
+    assert!(editor.undo_mask());
     assert_eq!(editor.masks.len(), 1);
     assert!(editor.undo_mask());
     assert!(editor.masks.is_empty());

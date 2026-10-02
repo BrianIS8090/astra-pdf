@@ -13,6 +13,7 @@ mod pdf;
 mod pixelate;
 mod print_pipeline;
 mod printing;
+mod session;
 mod ui;
 mod vault;
 mod version;

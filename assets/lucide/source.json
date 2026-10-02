@@ -1,0 +1,28 @@
+{
+  "repository": "https://github.com/lucide-icons/lucide",
+  "commit": "aace268b9be318c4f6d8a09a35139f860d07d9c5",
+  "icons": [
+    "folder-open",
+    "save",
+    "printer",
+    "chevron-left",
+    "chevron-right",
+    "minus",
+    "plus",
+    "scan",
+    "move-horizontal",
+    "rotate-cw",
+    "scroll",
+    "mouse-pointer-2",
+    "grid-3x3",
+    "shield",
+    "scan-line",
+    "undo-2",
+    "x",
+    "text-cursor-input",
+    "trash",
+    "files",
+    "layers",
+    "rotate-ccw"
+  ]
+}

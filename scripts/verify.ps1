@@ -55,6 +55,10 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка пикселизации в окне' }
   & $Python "$PSScriptRoot\verify_editor_ui.py" $exe "$outputDir\editing" "$outputDir\editor-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка инструментов и отмены' }
+  & $Python "$PSScriptRoot\verify_session_ui.py" $exe "$outputDir\editing\source.pdf" "$outputDir\session-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сеанса редактирования и сохранения' }
+  & $Python "$PSScriptRoot\verify_zoom_return.py" $exe "$outputDir\zoom-return"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка возврата масштаба с видимыми соседними страницами' }
   $env:ASTRA_SMOKE_PRINT = '1'
   Invoke-Viewer @('--ui-smoke', (Quoted $demo), (Quoted "$outputDir\window.png"))
   $env:ASTRA_SMOKE_PRINT = $null

@@ -71,8 +71,12 @@ def verify(exe, fixture, output):
       assert current['editor']['masks'][0]['kind']['Pixelate']['block_mm'] == mm
       assert current['editor']['bytes'] <= 16 * 1024 * 1024
     checks.append('three_block_sizes_and_bounded_cache')
+    for mm in [12, 3, 6]:
+      viewer.command(47)
+      wait(lambda: viewer.snapshot()['editor']['masks'][0]['kind']['Pixelate']['block_mm'] == mm)
+    checks.append('undo_pixel_size_changes_in_reverse_order')
     viewer.command(47)
-    assert not viewer.snapshot()['editor']['masks']
+    wait(lambda: not viewer.snapshot()['editor']['masks'])
     checks.append('undo_pixelation')
     for _ in range(3):
       viewer.command(18)
