@@ -119,6 +119,138 @@ pub fn extract(bytes: &[u8], pages: &[usize]) -> Result<Vec<u8>, String> {
   Ok(output)
 }
 
+pub fn separate_streams(bytes: &[u8], page: usize) -> Result<Vec<u8>, String> {
+  use lopdf::{
+    content::{Content, Operation as Op},
+    dictionary, Object, Stream,
+  };
+  fn flush(
+    doc: &mut lopdf::Document,
+    streams: &mut Vec<Object>,
+    chunk: &mut Vec<Op>,
+  ) -> Result<(), String> {
+    if chunk.is_empty() {
+      return Ok(());
+    }
+    if streams.len() >= 100_000 {
+      return Err("Слишком много объектов для редактирования.".into());
+    }
+    let bytes = Content {
+      operations: std::mem::take(chunk),
+    }
+    .encode()
+    .map_err(|e| e.to_string())?;
+    streams.push(Object::Reference(
+      doc.add_object(Stream::new(dictionary! {}, bytes)),
+    ));
+    Ok(())
+  }
+  let mut doc = lopdf::Document::load_mem(bytes).map_err(|e| e.to_string())?;
+  let id = *doc
+    .get_pages()
+    .get(&(page as u32 + 1))
+    .ok_or("Страница отсутствует.")?;
+  let content = doc.get_page_content(id);
+  let parsed =
+    Content::decode(&content).map_err(|_| "Этот поток PDF пока нельзя безопасно редактировать.")?;
+  let mut chunk = Vec::new();
+  let mut streams = Vec::new();
+  let mut in_text = false;
+  let mut in_path = false;
+  let mut text_state = Vec::new();
+  for operation in parsed.operations {
+    let name = operation.operator.as_str();
+    if in_text {
+      match name {
+        "ET" => {
+          chunk.push(operation);
+          flush(&mut doc, &mut streams, &mut chunk)?;
+          // Удаление текста не должно менять унаследованный шрифт и цвет соседей.
+          if !text_state.is_empty() {
+            chunk.push(Op::new("BT", vec![]));
+            chunk.append(&mut text_state);
+            chunk.push(Op::new("ET", vec![]));
+          }
+          in_text = false;
+          continue;
+        }
+        "Tf" | "Tc" | "Tw" | "Tz" | "TL" | "Tr" | "Ts" | "rg" | "RG" | "g" | "G" | "k" | "K"
+        | "cs" | "CS" | "sc" | "SC" | "scn" | "SCN" | "gs" => text_state.push(operation.clone()),
+        "TD" if operation.operands.len() == 2 => {
+          let leading = operation.operands[1]
+            .as_float()
+            .map_err(|e| e.to_string())?;
+          text_state.push(Op::new("TL", vec![Object::Real(-leading)]));
+        }
+        "\"" if operation.operands.len() == 3 => {
+          text_state.push(Op::new("Tw", vec![operation.operands[0].clone()]));
+          text_state.push(Op::new("Tc", vec![operation.operands[1].clone()]));
+        }
+        "Tj" | "TJ" | "'" | "Td" | "Tm" | "T*" => {}
+        _ => {
+          return Err(
+            "Сложная структура текстового блока пока не поддерживает безопасное редактирование."
+              .into(),
+          )
+        }
+      }
+      chunk.push(operation);
+      continue;
+    }
+    if in_path {
+      let end = matches!(
+        name,
+        "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "n"
+      );
+      if !end && !matches!(name, "m" | "l" | "c" | "v" | "y" | "h" | "re" | "W" | "W*") {
+        return Err(
+          "Сложная структура контура пока не поддерживает безопасное редактирование.".into(),
+        );
+      }
+      chunk.push(operation);
+      if end {
+        if chunk.last().unwrap().operator != "n"
+          && chunk
+            .iter()
+            .any(|o| matches!(o.operator.as_str(), "W" | "W*"))
+        {
+          return Err("Контур одновременно рисует и обрезает страницу. Его редактирование пока не поддерживается.".into());
+        }
+        flush(&mut doc, &mut streams, &mut chunk)?;
+        in_path = false;
+      }
+      continue;
+    }
+    if matches!(name, "BT" | "m" | "re" | "Do" | "sh") {
+      flush(&mut doc, &mut streams, &mut chunk)?;
+      in_text = name == "BT";
+      in_path = matches!(name, "m" | "re");
+      let standalone = matches!(name, "Do" | "sh");
+      chunk.push(operation);
+      if standalone {
+        flush(&mut doc, &mut streams, &mut chunk)?;
+      }
+    } else {
+      chunk.push(operation);
+    }
+  }
+  if in_text || in_path {
+    return Err("Незавершённый объект PDF: редактирование отменено.".into());
+  }
+  flush(&mut doc, &mut streams, &mut chunk)?;
+  // Потоки страницы выполняются последовательно с общим графическим состоянием.
+  // PDFium перегенерирует только поток изменённого объекта, сохраняя остальные команды.
+  doc
+    .get_object_mut(id)
+    .and_then(Object::as_dict_mut)
+    .map_err(|e| e.to_string())?
+    .set("Contents", Object::Array(streams));
+  doc.prune_objects();
+  let mut result = Vec::new();
+  doc.save_to(&mut result).map_err(|e| e.to_string())?;
+  Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

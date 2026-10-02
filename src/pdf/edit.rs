@@ -32,6 +32,14 @@ unsafe extern "C" fn write(out: *mut Output, data: *const c_void, size: u32) -> 
 
 impl Pdf {
   pub fn edit(&self, operation: &Operation) -> Result<Vec<u8>, String> {
+    if let Operation::Text { page, .. } | Operation::Delete { page, .. } = operation {
+      let bytes = crate::editing::separate_streams(&self._bytes, *page)?;
+      let prepared = Pdf::open(self.api.clone(), Arc::new(bytes))?;
+      return prepared.edit_inner(operation);
+    }
+    self.edit_inner(operation)
+  }
+  fn edit_inner(&self, operation: &Operation) -> Result<Vec<u8>, String> {
     if let Operation::Extract { pages } = operation {
       return crate::editing::extract(&self._bytes, pages);
     }
@@ -152,6 +160,16 @@ impl Pdf {
           return Err("Объект отсутствует. Выберите его повторно.".into());
         }
         let object = get(page, object_index as i32);
+        let mode = sym!(
+          "FPDFTextObj_GetTextRenderMode",
+          unsafe extern "C" fn(Handle) -> i32
+        );
+        if kind(object) == 1 && mode(object) >= 4 {
+          return Err(
+            "Текст задаёт обтравку других объектов. Его правка и удаление пока не поддерживаются."
+              .into(),
+          );
+        }
         if let Operation::Text { text, .. } = operation {
           if kind(object) != 1
             || text.is_empty()
@@ -219,10 +237,6 @@ impl Pdf {
           let insert = sym!(
             "FPDFPage_InsertObjectAtIndex",
             unsafe extern "C" fn(Handle, Handle, usize) -> i32
-          );
-          let mode = sym!(
-            "FPDFTextObj_GetTextRenderMode",
-            unsafe extern "C" fn(Handle) -> i32
           );
           if mode(object) != 0 {
             return Err(
@@ -302,6 +316,193 @@ impl Pdf {
 #[cfg(test)]
 mod tests {
   use super::*;
+  fn with_content(content: &[u8]) -> Vec<u8> {
+    let mut doc = lopdf::Document::load_mem(&crate::fixture::demo()).unwrap();
+    let page = doc.get_pages()[&1];
+    let stream = doc.add_object(lopdf::Stream::new(lopdf::dictionary! {}, content.to_vec()));
+    doc
+      .get_object_mut(page)
+      .unwrap()
+      .as_dict_mut()
+      .unwrap()
+      .set("Contents", stream);
+    let mut result = Vec::new();
+    doc.save_to(&mut result).unwrap();
+    result
+  }
+
+  #[test]
+  fn replacement_preserves_overlap_order_and_shared_graphics_state() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let bytes = with_content(b"q 1 0 0 rg 30 0 0 30 0 0 cm BT /F1 1 Tf 2 20 Td (OLD) Tj ET 0 0 1 rg 1 19 12 3 re f Q 0 1 0 RG 3 w 150 260 m 430 260 l 430 520 l 150 520 l S");
+    let pdf = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+    let changed = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: 0,
+        text: "NEW".into(),
+      })
+      .unwrap();
+    let edited = Pdf::open(api.clone(), Arc::new(changed)).unwrap();
+    for rotation in 0..4 {
+      let before = pdf.render(0, 600, 800, rotation, false).unwrap();
+      let after = edited.render(0, 600, 800, rotation, false).unwrap();
+      assert!(
+        before.pixels == after.pixels,
+        "Изменился порядок перекрытия или состояние графики при повороте {rotation}"
+      );
+    }
+  }
+
+  #[test]
+  fn deletion_preserves_layers_and_open_paths() {
+    use crate::layers::Layers;
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let source = crate::fixture::demo();
+    let pdf = Pdf::open(api.clone(), Arc::new(source.clone())).unwrap();
+    let objects: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let target = objects
+      .iter()
+      .find(|o| o.text.starts_with("ASTRA PDF"))
+      .unwrap();
+    let result = pdf
+      .edit(&Operation::Delete {
+        page: 0,
+        object: target.index,
+      })
+      .unwrap();
+    for states in [
+      [true, true, true],
+      [false, true, false],
+      [true, false, true],
+    ] {
+      let before = Pdf::open(
+        api.clone(),
+        Arc::new(Layers::read(&source).unwrap().with_states(&states).unwrap()),
+      )
+      .unwrap();
+      let after = Pdf::open(
+        api.clone(),
+        Arc::new(Layers::read(&result).unwrap().with_states(&states).unwrap()),
+      )
+      .unwrap();
+      let a = before.render(0, 600, 800, 0, false).unwrap();
+      let b = after.render(0, 600, 800, 0, false).unwrap();
+      assert!(
+        a.pixels[600 * 100 * 4..] == b.pixels[600 * 100 * 4..],
+        "Удаление затронуло соседние объекты или слои"
+      );
+    }
+  }
+
+  #[test]
+  fn deleting_layered_path_preserves_following_objects() {
+    use crate::layers::Layers;
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let prefix = "q /OC /Electric BDC 0.89 0.36 0.16 RG 4 w ";
+    let target = "150 260 m 430 260 l 430 520 l 150 520 l S ";
+    let suffix = "100 100 m 500 100 l S EMC /OC /Structure BDC 0 1 0 rg 200 600 50 50 re f EMC Q";
+    let source = with_content(format!("{prefix}{target}{suffix}").as_bytes());
+    let expected = with_content(format!("{prefix}{suffix}").as_bytes());
+    let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+    let changed = pdf.edit(&Operation::Delete { page: 0, object: 0 }).unwrap();
+    for states in [
+      [true, true, true],
+      [false, true, false],
+      [true, false, true],
+    ] {
+      let a = Pdf::open(
+        api.clone(),
+        Arc::new(
+          Layers::read(&changed)
+            .unwrap()
+            .with_states(&states)
+            .unwrap(),
+        ),
+      )
+      .unwrap();
+      let b = Pdf::open(
+        api.clone(),
+        Arc::new(
+          Layers::read(&expected)
+            .unwrap()
+            .with_states(&states)
+            .unwrap(),
+        ),
+      )
+      .unwrap();
+      assert!(
+        a.render(0, 600, 800, 0, false).unwrap().pixels
+          == b.render(0, 600, 800, 0, false).unwrap().pixels,
+        "Удаление контура повредило соседний объект или слой"
+      );
+    }
+  }
+
+  #[test]
+  fn deletion_preserves_inherited_text_font_color_and_spacing() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let source = with_content(b"BT /F1 18 Tf 0.8 0.1 0.2 rg 2 Tc 3 Tw 40 700 Td (REMOVE) Tj ET BT 40 600 Td (KEEP THIS) Tj ET 40 100 50 50 re f");
+    let expected = with_content(b"BT /F1 18 Tf 0.8 0.1 0.2 rg 2 Tc 3 Tw 40 700 Td ET BT 40 600 Td (KEEP THIS) Tj ET 40 100 50 50 re f");
+    let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+    let changed = pdf.edit(&Operation::Delete { page: 0, object: 0 }).unwrap();
+    let a = Pdf::open(api.clone(), Arc::new(changed)).unwrap();
+    let b = Pdf::open(api, Arc::new(expected)).unwrap();
+    assert!(
+      a.render(0, 600, 800, 0, false).unwrap().pixels
+        == b.render(0, 600, 800, 0, false).unwrap().pixels
+    );
+  }
+
+  #[test]
+  fn deleting_image_preserves_unrelated_vector_paths() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let suffix = "0 1 0 RG 3 w 150 260 m 430 260 l 430 520 l 150 520 l S";
+    let mut doc = lopdf::Document::load_mem(&with_content(
+      format!("q 80 0 0 80 20 700 cm /Im0 Do Q {suffix}").as_bytes(),
+    ))
+    .unwrap();
+    let image = doc.add_object(lopdf::Stream::new(lopdf::dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8 }, vec![255, 0, 0]));
+    let page = doc.get_pages()[&1];
+    doc
+      .get_object_mut(page)
+      .unwrap()
+      .as_dict_mut()
+      .unwrap()
+      .get_mut(b"Resources")
+      .unwrap()
+      .as_dict_mut()
+      .unwrap()
+      .set("XObject", lopdf::dictionary! { "Im0" => image });
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+    let objects: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(objects[0].kind, 3);
+    let changed = pdf.edit(&Operation::Delete { page: 0, object: 0 }).unwrap();
+    let a = Pdf::open(api.clone(), Arc::new(changed)).unwrap();
+    let b = Pdf::open(api, Arc::new(with_content(suffix.as_bytes()))).unwrap();
+    assert!(
+      a.render(0, 600, 800, 0, false).unwrap().pixels
+        == b.render(0, 600, 800, 0, false).unwrap().pixels
+    );
+  }
+
+  #[test]
+  fn deleting_text_used_as_a_clip_is_rejected() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(
+      api,
+      Arc::new(with_content(
+        b"BT /F1 18 Tf 7 Tr 40 700 Td (CLIP) Tj ET 0 0 600 800 re f",
+      )),
+    )
+    .unwrap();
+    assert!(pdf.edit(&Operation::Delete { page: 0, object: 0 }).is_err());
+  }
+
   #[test]
   fn object_removal_and_cyrillic_text_survive_reopen() {
     let api = Api::new(&crate::pdfium_path()).unwrap();
@@ -319,8 +520,15 @@ mod tests {
         text: "Проверка 123".into(),
       })
       .unwrap();
+    let before = pdf.render(0, 600, 800, 0, false).unwrap();
     drop(pdf);
     let changed = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+    let after = changed.render(0, 600, 800, 0, false).unwrap();
+    assert_eq!(
+      &before.pixels[600 * 100 * 4..],
+      &after.pixels[600 * 100 * 4..],
+      "Правка текста изменила нетронутую часть страницы"
+    );
     let list: Vec<PageObject> =
       serde_json::from_slice(&changed.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
     assert!(list
