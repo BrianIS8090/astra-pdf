@@ -29,7 +29,7 @@ $registered = 'HKCU:\Software\RegisteredApplications'
 $choiceKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.pdf\UserChoice'
 $checks = [Collections.Generic.List[string]]::new()
 if (!('AstraInstaller.Associations' -as [type])) {
-  Add-Type -TypeDefinition 'using System; using System.Text; using System.Runtime.InteropServices; namespace AstraInstaller { public static class Associations { [DllImport("shlwapi.dll", CharSet=CharSet.Unicode)] public static extern int AssocQueryString(uint flags, uint kind, string association, string extra, StringBuilder output, ref uint length); [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern uint GetLongPathName(string path, StringBuilder output, uint length); } }'
+  Add-Type -Path (Join-Path $PSScriptRoot 'InstallerChecks.cs')
 }
 function Assert-Check([bool]$Condition, [string]$Message) {
   if (!$Condition) { throw "Не пройдена проверка: $Message" }
@@ -103,9 +103,8 @@ try {
   Assert-Payload
   Assert-Check (Test-Path -LiteralPath $shortcut) 'Создан ярлык в меню Пуск'
   Assert-Check (Test-Path -LiteralPath $desktopShortcut) 'Создан выбранный ярлык рабочего стола'
-  $shell = New-Object -ComObject WScript.Shell
   # Оболочка может вернуть короткое имя 8.3, особенно при кириллице в другой локали.
-  $shortcutTarget = $shell.CreateShortcut($shortcut).TargetPath
+  $shortcutTarget = [AstraInstaller.Associations]::ShortcutTarget($shortcut)
   $longTarget = [Text.StringBuilder]::new(32768)
   $targetLength = [AstraInstaller.Associations]::GetLongPathName($shortcutTarget, $longTarget, 32768)
   Assert-Check ($targetLength -gt 0 -and $targetLength -lt 32768 -and $longTarget.ToString() -eq $exe) "Ярлык запускает установленную версию: $shortcutTarget"
