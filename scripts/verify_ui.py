@@ -136,7 +136,7 @@ def send(hwnd, message, wp=0, lp=0):
 def set_text(hwnd, value):
   buffer = c.create_unicode_buffer(value)
   assert send(hwnd, 0x0c, 0, c.addressof(buffer))
-  actual = c.create_unicode_buffer(len(value) + 1)
+  actual = c.create_unicode_buffer(len(value.encode('utf-16-le')) // 2 + 1)
   send(hwnd, 0x0d, len(actual), c.addressof(actual))
   assert actual.value == value
 

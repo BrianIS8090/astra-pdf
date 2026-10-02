@@ -6,7 +6,7 @@ $result = Get-Content (Join-Path $verified 'verification.json') -Raw | ConvertFr
 if (!$result.automated_checks_passed) { throw 'Автоматические проверки не подтверждены' }
 $origin = Join-Path $verified 'AstraPDF'
 $version = (Get-Content (Join-Path $origin 'version.json') -Raw | ConvertFrom-Json).version
-if ($result.native_print_range_acceptance -ne 'passed' -and $version -notmatch '-rc\.') { throw 'Нельзя упаковать стабильный выпуск без приёмки системной печати' }
+if ($result.native_print_range_acceptance -ne 'passed' -and $version -notmatch '-(alpha|beta|rc)\.') { throw 'Нельзя упаковать стабильный выпуск без приёмки системной печати' }
 if ((Get-FileHash (Join-Path $origin 'AstraPDF.exe')).Hash -ne $result.executable_sha256) { throw 'Проверенный EXE изменился' }
 foreach ($entry in (Get-Content (Join-Path $verified 'source-sha256.json') -Raw | ConvertFrom-Json)) {
   if ((Get-FileHash -LiteralPath (Join-Path $projectRoot $entry.file)).Hash -ne $entry.sha256) { throw "Изменён проверенный исходник: $($entry.file)" }

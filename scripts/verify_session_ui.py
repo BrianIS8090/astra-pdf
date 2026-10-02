@@ -93,10 +93,10 @@ def verify(exe, source, output):
       select()
       g = v.snapshot()['generation']
       v.command(42)
-      d = dialog('Изменить текст')
-      field = next(r['hwnd'] for r in windows(parent=d['hwnd']) if r['class'] == 'Edit')
+      wait(lambda:v.snapshot().get('draft') is not None)
+      field = next(r['hwnd'] for r in windows(parent=canvas) if r['class'] == 'Edit' and r['id']==140)
       set_text(field, text)
-      button(d, 1)
+      v.command(141)
       settle_change(g)
     change('Session edit ONE')
     assert state()['document_dirty'] and info(v.hwnd)['text'].startswith('* working.pdf')

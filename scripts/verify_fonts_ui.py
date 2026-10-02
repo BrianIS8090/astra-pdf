@@ -72,16 +72,16 @@ def verify(exe, source, output, word='Типовой', new='Типовой эт�
       wait(lambda: not state()['busy'] and state()['selected_object'] is not None)
     def change(value):
       nonlocal old
+      generation = v.snapshot()['generation']
       v.command(42)
-      d = wait(lambda: next((q for q in windows(v.pid) if q['visible'] and q['text'] == 'Изменить текст'), None))
-      field = next(q for q in windows(parent=d['hwnd']) if q['class'] == 'Edit')
+      wait(lambda: v.snapshot().get('draft') is not None)
+      field = next(q for q in windows(parent=canvas_hwnd) if q['class'] == 'Edit' and q['id'] == 140)
       edit = field['hwnd']
       if not old:
-        old = field['text']
+        old = v.snapshot()['draft']['text']
       set_text(edit, value)
-      button = next(q['hwnd'] for q in windows(parent=d['hwnd']) if q['class'] == 'Button' and q['id'] == 1)
-      u.PostMessageW(button, 0xf5, 0, 0)
-      wait(lambda: not u.IsWindowVisible(d['hwnd']))
+      v.command(141)
+      wait(lambda: v.snapshot()['generation'] > generation or (v.snapshot().get('draft') or {}).get('error'))
       wait(lambda: not state()['busy'])
     select()
     started = time.monotonic()
@@ -139,10 +139,10 @@ def verify(exe, source, output, word='Типовой', new='Типовой эт�
     saved = working.read_bytes()
     undo_count = state()['undo_count']
     change(new + ' 漢')
-    d = wait(lambda: next((q for q in windows(v.pid) if q['visible'] and q['class'] == 'AstraPdfDialog'), None))
+    wait(lambda: (v.snapshot().get('draft') or {}).get('error'))
     assert not state()['document_dirty'] and state()['undo_count'] == undo_count and working.read_bytes() == saved
-    u.PostMessageW(d['hwnd'], 0x10, 0, 0)
-    wait(lambda: not v.snapshot()['dialog_open'])
+    v.command(142)
+    wait(lambda: v.snapshot().get('draft') is None)
     checks.append('missing_glyph_rejected_without_mutation')
     v.command(47)
     wait(lambda: not state()['busy'] and state()['document_dirty'])

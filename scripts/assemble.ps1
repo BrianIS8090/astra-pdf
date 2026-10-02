@@ -5,6 +5,7 @@ $outputDir = [IO.Path]::GetFullPath($Destination)
 if (Test-Path -LiteralPath $outputDir) { throw "Для сборки нужна новая папка: $outputDir" }
 New-Item -ItemType Directory -Path $outputDir | Out-Null
 Copy-Item "$projectRoot\target\release\astra-pdf.exe" "$outputDir\AstraPDF.exe"
+& "$PSScriptRoot\sign.ps1" -Path "$outputDir\AstraPDF.exe"
 Copy-Item "$projectRoot\vendor\pdfium\bin\pdfium.dll" $outputDir
 Copy-Item "$projectRoot\vendor\pdfium\LICENSE" "$outputDir\PDFium-LICENSE.txt"
 Copy-Item "$projectRoot\vendor\pdfium\licenses" "$outputDir\licenses" -Recurse

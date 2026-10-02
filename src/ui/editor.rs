@@ -3,7 +3,7 @@ use crate::{
   dialogs,
   editing::{Mask, MaskKind, Operation, PageObject},
   engine::Client,
-  export,
+  export, recovery,
   session::{self, Revision, Session},
   vault,
 };
@@ -29,10 +29,13 @@ pub(super) const MASK_SELECT: usize = 56;
 pub(super) const MASK_DELETE: usize = 57;
 pub(super) const SAVE: usize = 58;
 pub(super) const SAVE_AS: usize = 59;
+pub(super) const REDO: usize = 60;
+pub(super) const RECOVER: usize = 61;
 
 pub(super) enum AfterSave {
   Close,
   Open(PathBuf),
+  Recover(Box<recovery::Entry>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -47,18 +50,29 @@ enum Mode {
 enum MaskUndo {
   Added(usize),
   Removed(usize, Mask),
-  Document(Arc<Revision>),
+  Document(Arc<Revision>, Vec<Mask>, &'static str),
   Masks(Vec<Mask>),
 }
+struct ObjectDrag {
+  page: usize,
+  index: usize,
+  original: [f64; 4],
+  bounds: [f64; 4],
+  start: (f64, f64),
+  resize: bool,
+}
 enum ResultItem {
+  Recovered(Box<recovery::Recovered>),
   Objects {
     page: usize,
     point: (f64, f64),
     objects: Vec<PageObject>,
   },
   Edited {
+    label: &'static str,
     before: Arc<Revision>,
     after: Arc<Revision>,
+    page_change: Option<(usize, Vec<Mask>)>,
   },
   Saved {
     path: PathBuf,
@@ -79,10 +93,14 @@ pub(super) struct Editor {
   pub masks: Vec<Mask>,
   selected_mask: Option<usize>,
   mask_undo: Vec<MaskUndo>,
+  mask_redo: Vec<MaskUndo>,
   drag: Option<Mask>,
   start: Option<(f64, f64)>,
   selected: Option<(usize, PageObject)>,
+  object_drag: Option<ObjectDrag>,
   session: Option<Session>,
+  recovery: Option<recovery::Writer>,
+  recovery_error: Option<String>,
   pub after_save: Option<AfterSave>,
   pub reload_states: Option<Vec<bool>>,
   receiver: Option<mpsc::Receiver<JobMessage>>,
@@ -93,54 +111,117 @@ pub(super) struct Editor {
 }
 
 impl Editor {
+  pub(super) fn revision(&self) -> Option<Arc<Revision>> {
+    self.session.as_ref().map(|s| s.current.clone())
+  }
+  pub(super) fn viewing(&self) -> bool {
+    self.mode == Mode::View
+  }
+  pub(super) fn history_description(&self) -> String {
+    let describe = |item: &MaskUndo| match item {
+      MaskUndo::Added(_) => "Добавление скрывающего блока",
+      MaskUndo::Removed(..) => "Удаление скрывающего блока",
+      MaskUndo::Masks(_) => "Настройка пикселизации",
+      MaskUndo::Document(_, _, label) => *label,
+    };
+    let mut text =
+      String::from("История текущего сеанса\n\nВыполненные действия (сначала последнее):\n");
+    for (i, item) in self.mask_undo.iter().rev().enumerate() {
+      text.push_str(&format!("{}. {}\n", i + 1, describe(item)));
+    }
+    if self.mask_undo.is_empty() {
+      text.push_str("Нет действий.\n");
+    }
+    text.push_str("\nМожно повторить:\n");
+    for (i, item) in self.mask_redo.iter().rev().enumerate() {
+      text.push_str(&format!("{}. {}\n", i + 1, describe(item)));
+    }
+    text.push_str("\nCtrl+Z — отменить, Ctrl+Y — повторить.\nХранятся последние 100 действий, не более 256 МиБ копий PDF.\nПосле восстановления сеанса прежняя история правок PDF недоступна.");
+    text
+  }
   pub(super) fn probe(&self) -> serde_json::Value {
     serde_json::json!({
       "masks": self.masks,
       "dirty": self.dirty(),
       "document_dirty": self.session.as_ref().is_some_and(Session::dirty),
       "undo_count": self.mask_undo.len(),
+      "redo_count": self.mask_redo.len(),
+      "recovery_saved": self.recovery.as_ref().is_some_and(|r| r.status().0),
+      "recovery_error": self.recovery_error,
       "mode": format!("{:?}", self.mode),
       "selected_mask": self.selected_mask,
       "selected_object": self.selected.as_ref().map(|(p, o)| serde_json::json!({"page":p,"index":o.index,"kind":o.kind,"bounds":o.bounds})),
       "busy": self.busy,
       "dragging": self.drag.is_some(),
+      "object_dragging":self.object_drag.is_some(),
       "grids": self.mosaic_plan.iter().map(|k| [k.page as i32, k.width, k.height]).collect::<Vec<_>>(),
       "ready": self.mosaic_plan.iter().filter(|k| self.grids.as_ref().and_then(|c| c.peek(k)).is_some()).count(),
       "bytes": self.grids.as_ref().map_or(0, |c| c.bytes)
     })
   }
 
+  fn record(&mut self, change: MaskUndo) {
+    self.mask_redo.clear();
+    self.mask_undo.push(change);
+    self.trim_history();
+  }
+
   fn add_mask(&mut self, mask: Mask) {
-    self.mask_undo.push(MaskUndo::Added(self.masks.len()));
+    self.record(MaskUndo::Added(self.masks.len()));
     self.masks.push(mask);
     self.selected_mask = None;
   }
 
   fn remove_mask(&mut self) {
     if let Some(index) = self.selected_mask.take().filter(|i| *i < self.masks.len()) {
-      self
-        .mask_undo
-        .push(MaskUndo::Removed(index, self.masks.remove(index)));
+      let mask = self.masks.remove(index);
+      self.record(MaskUndo::Removed(index, mask));
     }
   }
 
-  fn undo_mask(&mut self) -> bool {
-    if matches!(self.mask_undo.last(), Some(MaskUndo::Document(_))) {
-      return false;
-    }
-    let Some(change) = self.mask_undo.pop() else {
-      return false;
+  fn history_step(&mut self, redo: bool) -> Option<bool> {
+    let change = if redo {
+      self.mask_redo.pop()?
+    } else {
+      self.mask_undo.pop()?
     };
-    match change {
-      MaskUndo::Added(index) => {
-        self.masks.remove(index);
+    let document = matches!(change, MaskUndo::Document(..));
+    let inverse = match change {
+      MaskUndo::Added(index) => MaskUndo::Removed(index, self.masks.remove(index)),
+      MaskUndo::Removed(index, mask) => {
+        self.masks.insert(index, mask);
+        MaskUndo::Added(index)
       }
-      MaskUndo::Removed(index, mask) => self.masks.insert(index, mask),
-      MaskUndo::Masks(masks) => self.masks = masks,
-      MaskUndo::Document(_) => unreachable!(),
+      MaskUndo::Masks(masks) => MaskUndo::Masks(std::mem::replace(&mut self.masks, masks)),
+      MaskUndo::Document(previous, masks, label) => {
+        let session = self.session.as_mut()?;
+        MaskUndo::Document(
+          std::mem::replace(&mut session.current, previous),
+          std::mem::replace(&mut self.masks, masks),
+          label,
+        )
+      }
+    };
+    if redo {
+      self.mask_undo.push(inverse);
+    } else {
+      self.mask_redo.push(inverse);
     }
+    self.trim_history();
     self.selected_mask = None;
-    true
+    self.selected = None;
+    self.drag = None;
+    self.start = None;
+    self.object_drag = None;
+    Some(document)
+  }
+
+  #[cfg(test)]
+  fn undo_mask(&mut self) -> bool {
+    if matches!(self.mask_undo.last(), Some(MaskUndo::Document(..))) {
+      return false;
+    }
+    self.history_step(false).is_some()
   }
 
   fn stop_tool(&mut self) {
@@ -149,6 +230,7 @@ impl Editor {
     self.start = None;
     self.selected = None;
     self.selected_mask = None;
+    self.object_drag = None;
   }
 
   pub(super) fn active(&self, id: usize) -> bool {
@@ -173,23 +255,34 @@ impl Editor {
     !self.mask_undo.is_empty()
   }
 
+  pub(super) fn can_redo(&self) -> bool {
+    !self.mask_redo.is_empty()
+  }
+
   pub(super) fn dirty(&self) -> bool {
     !self.masks.is_empty() || self.session.as_ref().is_some_and(Session::dirty)
   }
 
   fn trim_history(&mut self) {
-    let mut bytes = 0;
-    let mut keep = self.mask_undo.len();
-    for item in self.mask_undo.iter().rev().take(100) {
-      if let MaskUndo::Document(r) = item {
-        bytes += r.size;
-      }
-      if bytes > 256 * 1024 * 1024 {
-        break;
-      }
-      keep -= 1;
+    let size = |item: &MaskUndo| match item {
+      MaskUndo::Document(r, _, _) => r.size,
+      _ => 0,
+    };
+    let mut bytes = self
+      .mask_undo
+      .iter()
+      .chain(&self.mask_redo)
+      .map(size)
+      .sum::<usize>();
+    while self.mask_undo.len() + self.mask_redo.len() > 100 || bytes > 256 * 1024 * 1024 {
+      // Удаляем наиболее далёкое действие, сохраняя непрерывность обеих цепочек.
+      let history = if self.mask_undo.len() >= self.mask_redo.len() {
+        &mut self.mask_undo
+      } else {
+        &mut self.mask_redo
+      };
+      bytes -= size(&history.remove(0));
     }
-    self.mask_undo.drain(..keep);
   }
 
   pub(super) fn selection_is_mask(&self) -> bool {
@@ -218,6 +311,7 @@ pub(super) unsafe fn menu(hwnd: HWND) {
         (SAVE, "Сохранить\tCtrl+S"),
         (SAVE_AS, "Сохранить как…\tCtrl+Shift+S"),
         (PAGES, "Сохранить отдельные страницы…"),
+        (RECOVER, "Восстановить сеанс после сбоя…"),
         (PRINT, "Печать…\tCtrl+P"),
       ],
     ),
@@ -225,10 +319,27 @@ pub(super) unsafe fn menu(hwnd: HWND) {
       "Редактирование",
       vec![
         (VIEW, "Просмотр"),
+        (reading::FIND, "Найти в документе…\tCtrl+F"),
+        (reading::TEXT, "Выделить текст"),
+        (reading::COPY, "Копировать выделенный текст\tCtrl+C"),
+        (reading::BOOKMARKS, "Закладки PDF"),
+        (reading::HISTORY, "История действий"),
         (SELECT, "Выбрать объект мышью"),
         (CHANGE_TEXT, "Изменить выбранный текст…"),
         (DELETE, "Удалить выбранный объект…"),
-        (UNDO, "Отменить последнее действие"),
+        (UNDO, "Отменить действие\tCtrl+Z"),
+        (REDO, "Повторить действие\tCtrl+Y"),
+      ],
+    ),
+    (
+      "Страницы",
+      vec![
+        (pages::DUPLICATE, "Дублировать текущую страницу"),
+        (pages::REMOVE, "Удалить текущую страницу"),
+        (pages::INSERT, "Вставить страницы из PDF…"),
+        (pages::MERGE, "Объединить с PDF…"),
+        (pages::UP, "Переместить выше"),
+        (pages::DOWN, "Переместить ниже"),
       ],
     ),
     (
@@ -247,10 +358,24 @@ pub(super) unsafe fn menu(hwnd: HWND) {
       ],
     ),
     (
+      "Замечания",
+      vec![
+        (review::TOOLS, "Панель замечаний и измерений"),
+        (review::COMMENT, "Комментарий"),
+        (review::RECTANGLE, "Прямоугольник"),
+        (review::ARROW, "Стрелка"),
+        (review::MARKER, "Маркер"),
+        (review::DISTANCE, "Измерить расстояние"),
+        (review::AREA, "Измерить площадь"),
+        (review::SCALE, "Масштаб чертежа…"),
+      ],
+    ),
+    (
       "Справка",
       vec![
         (HELP, "Как редактировать и скрывать"),
         (HISTORY, "Что нового"),
+        (updates::CHECK, "Проверить обновления…"),
         (ABOUT, "О программе"),
       ],
     ),
@@ -272,6 +397,108 @@ pub(super) unsafe fn menu(hwnd: HWND) {
 }
 
 impl App {
+  pub(super) unsafe fn commit_revision(&mut self, before: Arc<Revision>, after: Arc<Revision>) {
+    if before.hash == after.hash {
+      return;
+    }
+    let saved_hash = self
+      .editor
+      .session
+      .as_ref()
+      .map_or(before.hash, |s| s.saved_hash);
+    self.editor.record(MaskUndo::Document(
+      before,
+      self.editor.masks.clone(),
+      "Изменение текста",
+    ));
+    self.editor.session = Some(Session {
+      current: after,
+      saved_hash,
+    });
+    self.reload_revision();
+    self.status = "Текст изменён · Ctrl+Z — отменить · Ctrl+S — сохранить".into();
+  }
+  pub(super) unsafe fn apply_operation(
+    &mut self,
+    operation: Operation,
+    page_change: Option<(usize, Vec<Mask>)>,
+  ) {
+    let Some(path) = self.document_path() else {
+      return;
+    };
+    let Some(fingerprint) = self.editor.fingerprint else {
+      return;
+    };
+    let previous = self.editor.revision();
+    let masks = self.editor.masks.clone();
+    let pages = self.sizes.len();
+    let label = match &operation {
+      Operation::Text { .. } | Operation::FontText { .. } => "Изменение текста",
+      Operation::Delete { .. } => "Удаление объекта",
+      Operation::Transform { .. } => "Перемещение или размер объекта",
+      Operation::Annotate { .. } => "Замечание или измерение",
+      Operation::NoteDelete { .. } => "Удаление замечания",
+      Operation::NoteText { .. } => "Изменение комментария",
+      Operation::PageOrder { order } if order.len() < pages => "Удаление страницы",
+      Operation::PageOrder { order } if order.len() > pages => "Дублирование страницы",
+      Operation::PageOrder { .. } => "Перестановка страниц",
+      Operation::InsertPages { .. } => "Вставка страниц PDF",
+      _ => "Изменение PDF",
+    };
+    let inserted = match &operation {
+      Operation::InsertPages { at, .. } => Some(*at),
+      _ => None,
+    };
+    self.job(move |cancel, _| {
+      let before = if let Some(previous) = previous {
+        previous
+      } else {
+        let revision = Revision::new(&export::read(&path, vault::LIMIT)?)?;
+        if revision.hash != fingerprint {
+          return Err("Исходный файл изменился. Откройте его повторно.".into());
+        }
+        revision
+      };
+      let mut client = Client::spawn(&crate::pdfium_path())?;
+      client.open_checked(&path, fingerprint, || cancel.load(Ordering::Relaxed))?;
+      let bytes = client.edit(operation, || cancel.load(Ordering::Relaxed))?;
+      if cancel.load(Ordering::Relaxed) {
+        return Err("Изменение отменено.".into());
+      }
+      let after = Revision::new(&bytes)?;
+      let page_change = if let Some(at) = inserted {
+        let meta =
+          client.open_checked(&after.path, after.hash, || cancel.load(Ordering::Relaxed))?;
+        let count = meta
+          .sizes
+          .len()
+          .checked_sub(pages)
+          .ok_or("Вставка не добавила страницы.")?;
+        let masks = masks
+          .into_iter()
+          .map(|mut m| {
+            if m.page >= at {
+              m.page += count;
+            }
+            m
+          })
+          .collect();
+        Some((at, masks))
+      } else {
+        page_change
+      };
+      if cancel.load(Ordering::Relaxed) {
+        return Err("Изменение отменено.".into());
+      }
+      Ok(ResultItem::Edited {
+        label,
+        before,
+        after,
+        page_change,
+      })
+    });
+  }
+
   pub(super) fn document_path(&self) -> Option<PathBuf> {
     self
       .editor
@@ -279,6 +506,68 @@ impl App {
       .as_ref()
       .map(|s| s.current.path.clone())
       .or_else(|| self.path.clone())
+  }
+
+  pub(super) unsafe fn checkpoint(&mut self) {
+    if self.editor.busy || self.sizes.is_empty() {
+      return;
+    }
+    if !self.editor.dirty() {
+      self.editor.recovery = None;
+      self.editor.recovery_error = None;
+      return;
+    }
+    let (Some(path), Some(source), Some(current_hash)) = (
+      self.path.clone(),
+      self.document_path(),
+      self.editor.fingerprint,
+    ) else {
+      return;
+    };
+    let revision = self.editor.session.as_ref().map(|s| s.current.clone());
+    if revision.as_ref().is_some_and(|r| r.hash != current_hash) {
+      return;
+    }
+    let result = (|| {
+      if self.editor.recovery.is_none() {
+        self.editor.recovery = Some(recovery::Writer::new()?);
+      }
+      let writer = self.editor.recovery.as_ref().unwrap();
+      writer.submit(recovery::Snapshot {
+        source,
+        revision,
+        metadata: recovery::Metadata {
+          path,
+          current_hash,
+          saved_hash: self
+            .editor
+            .session
+            .as_ref()
+            .map_or(current_hash, |s| s.saved_hash),
+          masks: self.editor.masks.clone(),
+          states: self.states.clone(),
+          page: self.page,
+          pages: self.sizes.len(),
+          zoom: self.zoom,
+          rotation: self.rotation,
+          continuous: self.continuous,
+          detail_mode: self.detail_mode,
+          pixel_mm: self.editor.pixel_mm,
+        },
+      });
+      if let Some(error) = writer.status().1 {
+        return Err(error);
+      }
+      Ok::<_, String>(())
+    })();
+    if let Err(error) = result {
+      if self.editor.recovery_error.as_ref() != Some(&error) {
+        self.editor.recovery_error = Some(error.clone());
+        self.notice(format!("Автовосстановление временно недоступно: {error}\nСохраните свои правки вручную по Ctrl+S."));
+      }
+    } else {
+      self.editor.recovery_error = None;
+    }
   }
 
   pub(super) unsafe fn update_title(&self) {
@@ -298,6 +587,7 @@ impl App {
       return;
     };
     let logical = self.path.clone();
+    let review_mode = self.review.mode;
     let mut editor = std::mem::take(&mut self.editor);
     editor.selected = None;
     editor.grids = None;
@@ -307,6 +597,7 @@ impl App {
     self.open(path);
     self.path = logical;
     self.editor = editor;
+    self.review.mode = review_mode;
     self.page = page;
     self.zoom = zoom;
     self.rotation = rotation;
@@ -318,11 +609,21 @@ impl App {
     match self.editor.after_save.take() {
       Some(AfterSave::Close) => PostQuitMessage(0),
       Some(AfterSave::Open(path)) => self.open(path),
+      Some(AfterSave::Recover(entry)) => {
+        self.job(move |_, _| Ok(ResultItem::Recovered(Box::new(entry.recover()?))))
+      }
       None => (),
     }
   }
   pub(super) unsafe fn cancel_editor(&mut self) {
     self.editor.stop_tool();
+    self.reader.stop();
+    self.review.stop();
+    for (id, _) in review::BUTTONS {
+      InvalidateRect(self.control(id), ptr::null(), 1);
+    }
+    self.position_review_actions();
+    InvalidateRect(self.control(reading::TEXT), ptr::null(), 1);
     ReleaseCapture();
     if self.printing || self.editor.busy {
       self.cancel.store(true, Ordering::Relaxed);
@@ -340,7 +641,7 @@ impl App {
   pub(super) unsafe fn sync_editor_controls(&self) {
     self.update_title();
     self.enable_controls();
-    for id in [SELECT, MASK, COVER, MASK_SELECT, UNDO, SAVE, CANCEL] {
+    for id in [SELECT, MASK, COVER, MASK_SELECT, UNDO, REDO, SAVE, CANCEL] {
       CheckMenuItem(
         GetMenu(self.hwnd),
         id as u32,
@@ -357,23 +658,33 @@ impl App {
   }
 
   pub(super) unsafe fn position_editor_actions(&self) {
-    let target = if self.editor.busy || self.printing || self.dialog_open {
-      None
-    } else if let Some(mask) = self
-      .editor
-      .selected_mask
-      .and_then(|i| self.editor.masks.get(i))
-    {
-      self
-        .editor_rect(mask.page, mask.bounds)
-        .map(|r| (r, true, false))
-    } else {
-      self.editor.selected.as_ref().and_then(|(p, o)| {
+    if self.draft.is_some() {
+      for id in [CHANGE_TEXT, DELETE, MASK_DELETE] {
+        ShowWindow(self.control(id), SW_HIDE);
+      }
+      self.inline_layout();
+      return;
+    }
+    self.position_review_actions();
+    let target =
+      if self.editor.busy || self.printing || self.dialog_open || self.editor.object_drag.is_some()
+      {
+        None
+      } else if let Some(mask) = self
+        .editor
+        .selected_mask
+        .and_then(|i| self.editor.masks.get(i))
+      {
         self
-          .editor_rect(*p, o.bounds)
-          .map(|r| (r, false, o.kind == 1))
-      })
-    };
+          .editor_rect(mask.page, mask.bounds)
+          .map(|r| (r, true, false))
+      } else {
+        self.editor.selected.as_ref().and_then(|(p, o)| {
+          self
+            .editor_rect(*p, o.bounds)
+            .map(|r| (r, false, o.kind == 1))
+        })
+      };
     let view = self.viewport();
     let target =
       target.filter(|(r, _, _)| r.right > 0 && r.left < view.0 && r.bottom > 0 && r.top < view.1);
@@ -527,23 +838,61 @@ impl App {
           KillTimer(self.hwnd, 4);
           self.enable_controls();
           match result {
+            Ok(ResultItem::Recovered(recovered)) => {
+              let meta = recovered.entry.metadata().clone();
+              self.open(recovered.revision.path.clone());
+              self.path = Some(meta.path);
+              self.page = meta.page;
+              self.zoom = meta.zoom;
+              self.rotation = meta.rotation;
+              self.continuous = meta.continuous;
+              self.detail_mode = meta.detail_mode;
+              self.editor.pixel_mm = meta.pixel_mm;
+              self.editor.masks = meta.masks;
+              self.editor.mask_undo = (0..self.editor.masks.len()).map(MaskUndo::Added).collect();
+              self.editor.reload_states = Some(meta.states);
+              self.editor.session = Some(Session {
+                current: recovered.revision,
+                saved_hash: meta.saved_hash,
+              });
+              self.editor.recovery = Some(recovery::Writer::resume(recovered.entry));
+              self.status =
+                "Сеанс восстановлен. Исходный PDF не изменён; Ctrl+S — сохранить правки.".into();
+            }
             Ok(ResultItem::Info(message)) => {
               self.status = "Сохранено".into();
               self.notice(message);
             }
-            Ok(ResultItem::Edited { before, after }) => {
+            Ok(ResultItem::Edited {
+              label,
+              before,
+              after,
+              page_change,
+            }) => {
               let saved_hash = self
                 .editor
                 .session
                 .as_ref()
                 .map_or(before.hash, |s| s.saved_hash);
-              self.editor.mask_undo.push(MaskUndo::Document(before));
-              self.editor.trim_history();
+              self
+                .editor
+                .record(MaskUndo::Document(before, self.editor.masks.clone(), label));
+              if let Some((page, masks)) = &page_change {
+                self.page = *page;
+                self.editor.masks = masks.clone();
+              }
               self.editor.session = Some(Session {
                 current: after,
                 saved_hash,
               });
               self.reload_revision();
+              if let Some((page, _)) = page_change {
+                self.anchor = Some(ViewAnchor {
+                  page,
+                  fraction: (0., 0.),
+                  point: (self.unit(20), self.unit(20)),
+                });
+              }
               self.status = "Изменено · Ctrl+Z — отменить · Ctrl+S — сохранить".into();
             }
             Ok(ResultItem::Saved { path, hash }) => {
@@ -597,7 +946,7 @@ impl App {
               self.editor.selected = matches.get(next).cloned().map(|o| (page, o));
               self.status = if let Some((_, o)) = &self.editor.selected {
                 format!(
-                  "{} · объект {} · Редактирование → изменить или удалить",
+                  "{} · объект {} · перетащите рамку; угол — размер; Shift+щелчок — следующий объект",
                   kind_name(o.kind),
                   o.index + 1
                 )
@@ -625,7 +974,7 @@ impl App {
     }
   }
 
-  unsafe fn page_point(
+  pub(super) unsafe fn page_point(
     &self,
     point: (i32, i32),
     only: Option<usize>,
@@ -648,6 +997,79 @@ impl App {
   pub(super) unsafe fn editor_mouse(&mut self, msg: u32, lp: LPARAM) {
     if self.editor.busy || self.printing || self.dialog_open {
       return;
+    }
+    let cursor = ((lp as u16 as i16) as i32, ((lp >> 16) as u16 as i16) as i32);
+    if let Some(drag) = &self.editor.object_drag {
+      let page = drag.page;
+      if msg == WM_CAPTURECHANGED {
+        self.editor.object_drag = None;
+        return;
+      }
+      if let Some((_, p)) = self.page_point(cursor, Some(page)) {
+        let drag = self.editor.object_drag.as_mut().unwrap();
+        let b = drag.original;
+        drag.bounds = if drag.resize {
+          let mut rotated = export::rotate_bounds(b, self.rotation);
+          let p = export::rotate_point(p, self.rotation);
+          rotated[2] = p.0.max(rotated[0] + 0.002);
+          rotated[3] = p.1.max(rotated[1] + 0.002);
+          export::rotate_bounds(rotated, -self.rotation)
+        } else {
+          let (dx, dy) = (p.0 - drag.start.0, p.1 - drag.start.1);
+          [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy]
+        };
+      }
+      if msg == WM_LBUTTONUP {
+        let drag = self.editor.object_drag.take().unwrap();
+        ReleaseCapture();
+        if drag
+          .bounds
+          .iter()
+          .zip(drag.original)
+          .any(|(a, b)| (a - b).abs() > 0.0005)
+        {
+          self.apply_operation(
+            Operation::Transform {
+              page: drag.page,
+              object: drag.index,
+              bounds: drag.bounds,
+            },
+            None,
+          );
+        }
+      }
+      InvalidateRect(self.canvas, ptr::null(), 0);
+      return;
+    }
+    if msg == WM_LBUTTONDOWN
+      && self.editor.mode == Mode::Select
+      && GetKeyState(VK_SHIFT as i32) >= 0
+    {
+      if let Some((page, object)) = &self.editor.selected {
+        if let Some(r) = self.editor_rect(*page, object.bounds) {
+          let margin = self.unit(8);
+          if cursor.0 >= r.left - margin
+            && cursor.0 <= r.right + margin
+            && cursor.1 >= r.top - margin
+            && cursor.1 <= r.bottom + margin
+          {
+            if let Some((_, p)) = self.page_point(cursor, Some(*page)) {
+              let resize =
+                (cursor.0 - r.right).abs() <= margin && (cursor.1 - r.bottom).abs() <= margin;
+              self.editor.object_drag = Some(ObjectDrag {
+                page: *page,
+                index: object.index,
+                original: object.bounds,
+                bounds: object.bounds,
+                start: p,
+                resize,
+              });
+              SetCapture(self.canvas);
+              return;
+            }
+          }
+        }
+      }
     }
     // Перестановка кнопок порождает новые сообщения мыши. Без активной рамки
     // они не меняют редактор; повторная перерисовка может вытеснить таймер масштаба.
@@ -773,6 +1195,14 @@ impl App {
   }
 
   pub(super) unsafe fn editor_paint(&self, dc: HDC) {
+    if self.draft.is_some() {
+      return;
+    }
+    if let Some(drag) = &self.editor.object_drag {
+      if let Some(r) = self.editor_rect(drag.page, drag.bounds) {
+        DrawFocusRect(dc, &r);
+      }
+    }
     let masks: Vec<_> = self
       .editor
       .masks
@@ -877,6 +1307,19 @@ impl App {
         let old_pen = SelectObject(dc, pen);
         let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom);
+        if self.editor.selected_mask.is_none() && self.editor.mode == Mode::Select {
+          let radius = self.unit(4);
+          fill(
+            dc,
+            &RECT {
+              left: rect.right - radius,
+              top: rect.bottom - radius,
+              right: rect.right + radius,
+              bottom: rect.bottom + radius,
+            },
+            0x00c87818,
+          );
+        }
         SelectObject(dc, old_pen);
         SelectObject(dc, old_brush);
         DeleteObject(pen);
@@ -884,7 +1327,7 @@ impl App {
     }
   }
 
-  unsafe fn editor_rect(&self, page: usize, bounds: [f64; 4]) -> Option<RECT> {
+  pub(super) unsafe fn editor_rect(&self, page: usize, bounds: [f64; 4]) -> Option<RECT> {
     let p = self.document_layout.pages.get(page)?;
     if !self.visible_pages().contains(&page) {
       return None;
@@ -937,6 +1380,11 @@ pub(super) unsafe fn command(hwnd: HWND, id: usize) {
 }
 
 unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
+  if id == RECOVER {
+    with_app(|a| a.dialog_open = false);
+    offer_recovery(hwnd, false);
+    return Ok(());
+  }
   match id {
     HISTORY => {
       dialogs::prompt(
@@ -997,6 +1445,12 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
   match id {
     SELECT | MASK | COVER | MASK_SELECT | VIEW => {
       with_app(|a| {
+        a.reader.stop();
+        a.review.stop();
+        for (id, _) in review::BUTTONS {
+          InvalidateRect(a.control(id), ptr::null(), 1);
+        }
+        InvalidateRect(a.control(reading::TEXT), ptr::null(), 1);
         let next = match id {
           SELECT => Mode::Select,
           MASK => Mode::Pixelate,
@@ -1047,9 +1501,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
           .iter()
           .any(|m| matches!(m.kind, MaskKind::Pixelate { block_mm: old } if old != block_mm))
         {
-          a.editor
-            .mask_undo
-            .push(MaskUndo::Masks(a.editor.masks.clone()));
+          a.editor.record(MaskUndo::Masks(a.editor.masks.clone()));
         }
         for mask in &mut a.editor.masks {
           if matches!(mask.kind, MaskKind::Pixelate { .. }) {
@@ -1069,20 +1521,25 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
         InvalidateRect(a.hwnd, ptr::null(), 0);
       });
     }
-    UNDO => {
+    UNDO | REDO => {
       with_app(|a| {
-        if a.editor.undo_mask() {
-          a.status = "Последнее изменение скрывающих блоков отменено.".into();
-          InvalidateRect(a.canvas, ptr::null(), 0);
-        } else if let Some(MaskUndo::Document(previous)) = a.editor.mask_undo.pop() {
-          if let Some(session) = &mut a.editor.session {
-            session.current = previous;
+        ReleaseCapture();
+        if let Some(document) = a.editor.history_step(id == REDO) {
+          if document {
+            a.reload_revision();
           }
-          a.reload_revision();
+          a.status = if id == REDO {
+            "Действие повторено · Ctrl+Z — отменить"
+          } else {
+            "Действие отменено · Ctrl+Y — повторить"
+          }
+          .into();
         } else {
-          a.status = "Нет действий для отмены.".into();
+          a.status = "Нет доступных действий.".into();
         }
         a.request_mosaics();
+        SetFocus(a.canvas);
+        InvalidateRect(a.canvas, ptr::null(), 0);
       });
     }
     MASK_DELETE => {
@@ -1115,24 +1572,18 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     CHANGE_TEXT | DELETE => {
       let (page, object) = selected
         .ok_or("Сначала выберите «Редактирование → Выбрать объект мышью» и нажмите на объект.")?;
-      let operation = if id == CHANGE_TEXT {
+      if id == CHANGE_TEXT {
         if object.kind != 1 {
-          return Err("Выбран не текстовый объект. В сканах текст является частью изображения; вложенные группы пока редактируются целиком.".into());
+          return Err(
+            "Выбран не текстовый объект. В сканах текст является частью изображения.".into(),
+          );
         }
-        let Some(text)=dialogs::prompt(hwnd,"Изменить текст","Шрифт, начертание, размер, цвет и интервалы сохраняются.\nСтрока не переносится автоматически. Если в исходном шрифте нет нужных символов, правка будет отменена.",&object.text,false) else { return Ok(()); };
-        if text == object.text {
-          return Ok(());
-        }
-        Operation::Text {
-          page,
-          object: object.index,
-          text,
-        }
-      } else {
-        Operation::Delete {
-          page,
-          object: object.index,
-        }
+        with_app(|a| a.begin_inline(page, object));
+        return Ok(());
+      }
+      let operation = Operation::Delete {
+        page,
+        object: object.index,
       };
       let previous = with_app(|a| a.editor.session.as_ref().map(|s| s.current.clone())).flatten();
       with_app(|a| {
@@ -1157,7 +1608,12 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
           if cancel.load(Ordering::Relaxed) {
             return Err("Изменение отменено.".into());
           }
-          Ok(ResultItem::Edited { before, after })
+          Ok(ResultItem::Edited {
+            label: "Удаление объекта",
+            before,
+            after,
+            page_change: None,
+          })
         })
       });
     }
@@ -1277,6 +1733,19 @@ unsafe fn save_document(hwnd: HWND, save_as: bool) -> Result<(), String> {
 }
 
 pub(super) unsafe fn leave_document(hwnd: HWND, next: AfterSave) {
+  if with_app(|a| {
+    a.remember_reading();
+    if a.draft.is_some() {
+      a.status = "Сначала примените текст (Ctrl+Enter) или отмените правку (Esc).".into();
+      true
+    } else {
+      false
+    }
+  })
+  .unwrap_or(false)
+  {
+    return;
+  }
   let allowed = with_app(|a| {
     if a.dialog_open {
       return false;
@@ -1399,6 +1868,54 @@ unsafe fn restore(hwnd: HWND) {
   });
 }
 
+pub(super) unsafe fn offer_recovery(hwnd: HWND, startup: bool) {
+  let eligible = with_app(|a| !a.dialog_open && !a.editor.busy && !a.printing).unwrap_or(false);
+  if !eligible {
+    return;
+  }
+  let result = recovery::pending();
+  let mut entries = match result {
+    Ok(entries) => entries,
+    Err(error) => {
+      with_app(|a| a.notice(error));
+      return;
+    }
+  };
+  if startup {
+    if let Some(path) = with_app(|a| a.path.clone()).flatten() {
+      entries.retain(|e| export::same_file(&e.metadata().path, &path));
+    }
+  }
+  let Some(entry) = entries.into_iter().next() else {
+    if !startup {
+      with_app(|a| {
+        a.notice("Незавершённых сеансов не найдено. Сеансы других открытых окон не предлагаются для восстановления.".into())
+      });
+    }
+    return;
+  };
+  let label = entry
+    .metadata()
+    .path
+    .file_name()
+    .unwrap_or_default()
+    .to_string_lossy();
+  let message = format!("Найден незавершённый сеанс: {label}\nВосстановить правки PDF и области скрытия?\n\nДа — восстановить; Нет — удалить эту рабочую копию; Отмена — оставить на потом.\nИсходный PDF не изменится. История действий до сбоя не восстанавливается.");
+  with_app(|a| a.dialog_open = true);
+  let answer = MessageBoxW(
+    hwnd,
+    wide(&message).as_ptr(),
+    wide("Восстановление сеанса").as_ptr(),
+    MB_YESNOCANCEL | MB_ICONQUESTION,
+  );
+  with_app(|a| a.dialog_open = false);
+  if answer == IDYES {
+    leave_document(hwnd, AfterSave::Recover(Box::new(entry)));
+  } else if answer == IDNO {
+    entry.discard();
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1460,15 +1977,102 @@ mod tests {
     editor.add_mask(mask(0.1));
     editor.selected_mask = Some(0);
     editor.remove_mask();
-    editor.mask_undo.push(MaskUndo::Document(revision));
+    editor
+      .mask_undo
+      .push(MaskUndo::Document(revision, vec![], "Изменение PDF"));
     assert!(!editor.undo_mask());
     assert!(matches!(
       editor.mask_undo.pop(),
-      Some(MaskUndo::Document(_))
+      Some(MaskUndo::Document(..))
     ));
     assert!(editor.undo_mask());
     assert_eq!(editor.masks.len(), 1);
     assert!(editor.undo_mask());
     assert!(editor.masks.is_empty());
+  }
+  #[test]
+  fn redo_masks_preserves_order_and_new_edits_clear_redo() {
+    let mut editor = Editor::default();
+    editor.add_mask(mask(0.1));
+    editor.add_mask(mask(0.3));
+    editor.selected_mask = Some(0);
+    editor.remove_mask();
+    assert_eq!(editor.history_step(false), Some(false));
+    assert_eq!(editor.masks[0].bounds[0], 0.1);
+    assert_eq!(editor.history_step(true), Some(false));
+    assert_eq!(editor.masks.len(), 1);
+    assert_eq!(editor.masks[0].bounds[0], 0.3);
+    editor.history_step(false);
+    editor.add_mask(mask(0.5));
+    assert!(!editor.can_redo());
+    assert_eq!(editor.masks.len(), 3);
+  }
+
+  #[test]
+  fn document_redo_and_save_keep_dirty_state_correct() {
+    let before = Revision::new(b"before").unwrap();
+    let after = Revision::new(b"after").unwrap();
+    let mut editor = Editor {
+      session: Some(Session {
+        current: after.clone(),
+        saved_hash: after.hash,
+      }),
+      ..Editor::default()
+    };
+    editor.record(MaskUndo::Document(before.clone(), vec![], "Изменение PDF"));
+    assert!(!editor.dirty());
+    assert_eq!(editor.history_step(false), Some(true));
+    assert!(editor.dirty());
+    assert_eq!(editor.session.as_ref().unwrap().current.hash, before.hash);
+    assert_eq!(editor.history_step(true), Some(true));
+    assert!(!editor.dirty());
+    assert_eq!(editor.session.as_ref().unwrap().current.hash, after.hash);
+  }
+
+  #[test]
+  fn pixel_size_change_redo_restores_the_actual_masks() {
+    let mut editor = Editor::default();
+    editor.add_mask(mask(0.1));
+    editor.record(MaskUndo::Masks(editor.masks.clone()));
+    editor.masks[0].kind = MaskKind::Pixelate { block_mm: 12 };
+    editor.history_step(false);
+    assert_eq!(editor.masks[0].kind, MaskKind::Cover);
+    editor.history_step(true);
+    assert_eq!(editor.masks[0].kind, MaskKind::Pixelate { block_mm: 12 });
+  }
+
+  #[test]
+  fn mask_history_has_the_same_bound_as_document_history() {
+    let mut editor = Editor::default();
+    for _ in 0..150 {
+      editor.add_mask(mask(0.1));
+    }
+    assert_eq!(editor.mask_undo.len(), 100);
+    for _ in 0..100 {
+      assert_eq!(editor.history_step(false), Some(false));
+    }
+    assert_eq!(editor.masks.len(), 50);
+    for _ in 0..100 {
+      assert_eq!(editor.history_step(true), Some(false));
+    }
+    assert_eq!(editor.masks.len(), 150);
+  }
+
+  #[test]
+  fn undo_rechecks_budget_when_large_current_revision_moves_to_redo() {
+    let before = Revision::new(b"before").unwrap();
+    let mut after = Revision::new(b"after").unwrap();
+    Arc::get_mut(&mut after).unwrap().size = 257 * 1024 * 1024;
+    let mut editor = Editor {
+      session: Some(Session {
+        saved_hash: after.hash,
+        current: after,
+      }),
+      ..Editor::default()
+    };
+    editor.record(MaskUndo::Document(before.clone(), vec![], "Изменение PDF"));
+    assert_eq!(editor.history_step(false), Some(true));
+    assert_eq!(editor.session.as_ref().unwrap().current.hash, before.hash);
+    assert!(!editor.can_redo());
   }
 }

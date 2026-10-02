@@ -1,7 +1,7 @@
 use crate::pdf::Raster;
 use std::collections::VecDeque;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Zoom {
   FitPage,
   FitWidth,

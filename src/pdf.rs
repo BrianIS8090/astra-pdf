@@ -1,5 +1,9 @@
 use crate::model::Region;
+mod annotation;
 mod edit;
+mod font;
+mod groups;
+mod reading;
 mod text;
 use libloading::Library;
 use std::{cell::RefCell, collections::VecDeque, ffi::c_void, path::Path, ptr, rc::Rc, sync::Arc};

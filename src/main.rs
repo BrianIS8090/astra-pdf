@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod annotation;
 mod dialogs;
 mod editing;
 mod editing_check;
@@ -9,12 +10,17 @@ mod fixture;
 mod layers;
 mod layout;
 mod model;
+mod pages;
 mod pdf;
 mod pixelate;
+mod preferences;
 mod print_pipeline;
 mod printing;
+mod reading;
+mod recovery;
 mod session;
 mod ui;
+mod updates;
 mod vault;
 mod version;
 #[cfg(test)]

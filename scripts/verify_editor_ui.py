@@ -147,10 +147,9 @@ def verify(exe, fixture, output):
     capture('text-actions.png')
     checks.append('text_selection_shows_floating_actions')
     button(42)
-    dialog = wait(lambda: next((v for v in windows(viewer.pid) if v['class'] == 'AstraPdfDialog' and v['visible']), None))
-    assert dialog['text'] == 'Изменить текст'
-    u.PostMessageW(dialog['hwnd'], 0x100, 27, 0)
-    wait(lambda: not viewer.snapshot()['dialog_open'])
+    wait(lambda: viewer.snapshot().get('draft') is not None)
+    viewer.command(142)
+    wait(lambda: viewer.snapshot().get('draft') is None)
     generation = viewer.snapshot()['generation']
     button(43)
     viewer.ready(lambda s: s['generation'] > generation)

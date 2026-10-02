@@ -59,6 +59,14 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сеанса редактирования и сохранения' }
   & $Python "$PSScriptRoot\verify_fonts_ui.py" $exe "$outputDir\fonts-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сохранения шрифтов и оформления' }
+  & $Python "$PSScriptRoot\verify_inline_ui.py" $exe "$outputDir\fonts-ui\fonts.pdf" "$outputDir\inline-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка текста на странице и изменения размеров' }
+  & $Python "$PSScriptRoot\verify_pages_ui.py" $exe $demo "$outputDir\pages-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка управления страницами' }
+  & $Python "$PSScriptRoot\verify_review_ui.py" $exe $demo "$outputDir\review-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка замечаний и измерений' }
+  & $Python "$PSScriptRoot\verify_navigation_ui.py" $exe "$outputDir\navigation-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка ссылок, закладок и места чтения' }
   & $Python "$PSScriptRoot\verify_zoom_return.py" $exe "$outputDir\zoom-return"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка возврата масштаба с видимыми соседними страницами' }
   $env:ASTRA_SMOKE_PRINT = '1'

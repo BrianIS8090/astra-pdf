@@ -37,6 +37,7 @@ if ($LASTEXITCODE -ne 0) { throw "Не удалось собрать устан�
 $suffix = if ($TestIdentity) { '-test' } else { '' }
 $installer = Join-Path $output "AstraPDF-$version-setup$suffix-x64.exe"
 if (!(Test-Path -LiteralPath $installer)) { throw 'Сборка не создала установщик' }
+& "$PSScriptRoot\sign.ps1" -Path $installer
 $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
 "$installerHash  $([IO.Path]::GetFileName($installer))" | Set-Content -LiteralPath "$installer.sha256" -Encoding ASCII
 Write-Output "Установщик: $installer"

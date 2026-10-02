@@ -27,7 +27,12 @@ use windows_sys::Win32::{
 
 const OPEN: usize = 10;
 mod editor;
+mod inline;
+mod pages;
+mod reading;
+mod review;
 mod tools;
+mod updates;
 const PRINT: usize = 11;
 const PREV: usize = 12;
 const NEXT: usize = 13;
@@ -61,6 +66,11 @@ thread_local! { static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 
 struct App {
   editor: editor::Editor,
+  draft: Option<inline::Draft>,
+  updates: updates::Updates,
+  reader: reading::Reader,
+  review: review::Review,
+  recent: Vec<crate::preferences::Recent>,
   hwnd: HWND,
   canvas: HWND,
   controls: Vec<(usize, HWND)>,
@@ -100,6 +110,10 @@ struct App {
   print_result: Option<bool>,
   dialog_open: bool,
   pending_error: Option<String>,
+  pending_recent: Option<PathBuf>,
+  pending_insert: Option<(PathBuf, String, usize)>,
+  drag_page: Option<usize>,
+  page_drag_message: u32,
   continuous: bool,
   document_layout: DocumentLayout,
   layout_key: Option<LayoutKey>,
@@ -251,6 +265,10 @@ impl App {
       ptr::null(),
     );
     DragAcceptFiles(self.hwnd, 1);
+    self.setup_review();
+    self.setup_reader();
+    self.setup_pages();
+    self.setup_inline();
     self.setup_editor_controls();
     self.layout();
     self.enable_controls();
@@ -319,7 +337,7 @@ impl App {
     GetClientRect(self.hwnd, &mut r);
     let width = (r.right as f64 * 96. / self.dpi as f64) as i32;
     let height = (r.bottom as f64 * 96. / self.dpi as f64) as i32;
-    let wrapped = width < 1040;
+    let wrapped = width < 980;
     for (id, x, w) in [
       (OPEN, 12, 32),
       (editor::SAVE, 48, 32),
@@ -344,6 +362,7 @@ impl App {
       editor::COVER,
       editor::MASK_SELECT,
       editor::UNDO,
+      editor::REDO,
       CANCEL,
     ]
     .iter()
@@ -351,12 +370,13 @@ impl App {
     {
       self.place(*id, tools_x + i as i32 * 36, tools_y, 32, 32);
     }
-    let top = if wrapped { 94 } else { 52 };
+    let base = if wrapped { 94 } else { 52 };
+    let top = base + if self.review.open { 40 } else { 0 };
     self.toolbar_height = top;
     self.place(TAB_PAGES, 12, top + 10, 112, 32);
-    self.place(TAB_LAYERS, 128, top + 10, 100, 32);
+    self.place(TAB_LAYERS, 128, top + 10, 32, 32);
     self.place(VIEW_MODE, 12, top + 50, 216, 120);
-    self.place(PAGE_LIST, 12, top + 96, 216, (height - top - 136).max(30));
+    self.place(PAGE_LIST, 12, top + 126, 216, (height - top - 166).max(30));
     SendMessageW(
       self.control(PAGE_LIST),
       LB_SETITEMHEIGHT,
@@ -369,9 +389,9 @@ impl App {
     MoveWindow(
       self.canvas,
       self.unit(240),
-      self.unit(top),
+      self.unit(top + if self.reader.search_open { 40 } else { 0 }),
       self.unit((width - 240).max(1)),
-      self.unit((height - top - 32).max(1)),
+      self.unit((height - top - 32 - if self.reader.search_open { 40 } else { 0 }).max(1)),
       1,
     );
     ShowWindow(
@@ -418,6 +438,9 @@ impl App {
       } as usize,
       0,
     );
+    self.reader_layout(width, height, top, tools_x, tools_y);
+    self.pages_layout(top);
+    self.review_layout(base, tools_x, tools_y);
     self.position_editor_actions();
     self.center_page_number();
     self.update_scroll();
@@ -449,8 +472,15 @@ impl App {
       let enabled = match *id {
         OPEN => !self.printing,
         TAB_PAGES | TAB_LAYERS | LAYER_NOTE => true,
-        CANCEL => self.printing || self.editor.can_cancel(),
+        CANCEL => {
+          self.printing
+            || self.editor.can_cancel()
+            || self.reader.text_mode
+            || self.reader.search_open
+            || self.review.can_cancel()
+        }
         editor::UNDO => loaded && self.editor.can_undo() && !self.printing,
+        editor::REDO => loaded && self.editor.can_redo() && !self.printing,
         editor::SAVE => loaded && self.editor.dirty() && !self.printing,
         editor::SELECT | editor::MASK | editor::COVER | editor::MASK_SELECT => {
           loaded && !self.printing
@@ -492,6 +522,9 @@ impl App {
   }
 
   unsafe fn open(&mut self, path: PathBuf) {
+    self.remember_reading();
+    self.reader = reading::Reader::default();
+    self.review.stop();
     self.editor.reset();
     self.opened_at = std::time::Instant::now();
     self.first_frame_ms = None;
@@ -968,10 +1001,50 @@ impl App {
   }
 
   unsafe fn action(&mut self, id: usize) {
+    if id == updates::CHECK {
+      self.check_updates();
+      return;
+    }
+    if (inline::APPLY..=inline::CHOICE).contains(&id) {
+      self.inline_action(id);
+      return;
+    }
+    if self.draft.is_some() {
+      if id == CANCEL {
+        self.cancel_inline();
+      } else if id == editor::SAVE {
+        if let Some(d) = &mut self.draft {
+          d.save = true;
+        }
+        self.inline_action(inline::APPLY);
+      } else {
+        self.status = "Сначала примените текст (Ctrl+Enter) или отмените правку (Esc).".into();
+      }
+      return;
+    }
     if self.editor.busy && id != CANCEL {
       return;
     }
-    if (editor::PAGES..=editor::SAVE_AS).contains(&id) {
+    if (reading::RECENT..reading::RECENT + 12).contains(&id) {
+      if let Some(item) = self.recent.get(id - reading::RECENT) {
+        self.pending_recent = Some(item.path.clone());
+        PostMessageW(self.hwnd, WM_APP + 26, 0, 0);
+      }
+      return;
+    }
+    if (review::TOOLS..=review::REMOVE).contains(&id) {
+      self.review_action(id);
+      return;
+    }
+    if (pages::REMOVE..=pages::DOWN).contains(&id) {
+      self.page_action(id);
+      return;
+    }
+    if (reading::FIND..=reading::COPY).contains(&id) {
+      self.reader_action(id);
+      return;
+    }
+    if (editor::PAGES..=editor::RECOVER).contains(&id) {
       PostMessageW(self.hwnd, WM_APP + 21, id, 0);
       return;
     }
@@ -1035,6 +1108,7 @@ impl App {
         self.navigate(self.page);
       }
       TAB_PAGES | TAB_LAYERS => {
+        self.reader.bookmarks_open = false;
         self.layer_tab = id == TAB_LAYERS;
         self.layout();
         self.request_thumbnails();
@@ -1102,6 +1176,10 @@ impl App {
         } if generation == self.generation => {
           self.editor.fingerprint = Some(fingerprint);
           self.sizes = sizes;
+          self.page = self.page.min(self.sizes.len().saturating_sub(1));
+          if self.editor.revision().is_none() {
+            self.resume_reading(fingerprint);
+          }
           self.status = format!("Открыто за {millis} мс · анализ слоёв…");
           let list = self.control(PAGE_LIST);
           SendMessageW(list, WM_SETREDRAW, 0, 0);
@@ -1126,7 +1204,12 @@ impl App {
             .editor
             .reload_states
             .take()
-            .filter(|v| v.len() == items.len())
+            .map(|mut v| {
+              v.truncate(items.len());
+              let old = v.len();
+              v.extend(items.iter().skip(old).map(|l| l.visible));
+              v
+            })
             .unwrap_or_else(|| items.iter().map(|l| l.visible).collect());
           self.layers = items;
           self.groups = groups;
@@ -1236,7 +1319,7 @@ impl App {
         0x00e4dfda,
       );
     }
-    if self.toolbar_height == 52 && !self.sizes.is_empty() {
+    if self.toolbar_height == 52 && r.right >= self.unit(1140) && !self.sizes.is_empty() {
       text(
         dc,
         RECT {
@@ -1402,7 +1485,10 @@ impl App {
         DT_CENTER,
       );
     }
+    self.reader_paint(mem);
+    self.inline_paint(mem);
     self.editor_paint(mem);
+    self.review_paint(mem);
     BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
     DeleteObject(bitmap);
@@ -1607,6 +1693,32 @@ impl App {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+  if msg == WM_APP + 31 {
+    updates::show(hwnd);
+    return 0;
+  }
+  if msg == WM_APP + 30 {
+    inline::choose_font(hwnd);
+    return 0;
+  }
+  if msg == WM_APP + 29 {
+    review::dialog(hwnd, wp);
+    return 0;
+  }
+  if msg == WM_APP + 27 {
+    pages::insert_dialog(hwnd, wp == pages::MERGE);
+    return 0;
+  }
+  if msg == WM_APP + 26 {
+    if let Some(path) = with_app(|a| a.pending_recent.take()).flatten() {
+      editor::leave_document(hwnd, editor::AfterSave::Open(path));
+    }
+    return 0;
+  }
+  if msg == WM_APP + 24 {
+    editor::offer_recovery(hwnd, true);
+    return 0;
+  }
   if msg == WM_APP + 21 {
     editor::command(hwnd, wp);
     return 0;
@@ -1812,6 +1924,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
           &report[..report.len()-1], a.detail_mode, tiles.len(), tiles.iter().filter(|k| a.details.peek(k).is_some()).count(), a.details.bytes, [a.viewport().0,a.viewport().1]);
         let mut report: serde_json::Value = serde_json::from_str(&report).unwrap();
         report["editor"] = a.editor.probe();
+        report["status"] = serde_json::json!(a.status);
+        report["reader"] = a.reader.probe();
+        report["draft"] = a
+          .draft
+          .as_ref()
+          .map(inline::Draft::probe)
+          .unwrap_or(serde_json::Value::Null);
+        report["review"] = a.review.probe();
+        report["reader"]["selected_text"] =
+          serde_json::json!(a.reader.selected_text(&a.editor.masks));
         report["page_origins"] = serde_json::json!(a
           .visible_pages()
           .iter()
@@ -1910,6 +2032,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     return 0;
   }
   let result = with_app(|app| match msg {
+    msg if msg == app.page_drag_message => Some(app.page_drag(&*(lp as *const DRAGLISTINFO))),
+    WM_INITMENUPOPUP => {
+      app.recent_menu();
+      Some(0)
+    }
     WM_DRAWITEM => {
       let item = &*(lp as *const DRAWITEMSTRUCT);
       if item.CtlID == PAGE_LIST as u32 {
@@ -1936,6 +2063,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       Some(0)
     }
     WM_ERASEBKGND => Some(1),
+    WM_CTLCOLORSTATIC => {
+      let dc = wp as HDC;
+      SetBkMode(dc, TRANSPARENT as i32);
+      SetTextColor(dc, 0x005a4b3b);
+      SetDCBrushColor(dc, 0x00faf9f8);
+      Some(GetStockObject(DC_BRUSH) as isize)
+    }
     WM_PRINTCLIENT => {
       app.paint(Some(wp as HDC));
       Some(0)
@@ -1971,7 +2105,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     WM_COMMAND => {
       let id = wp & 0xffff;
       let notification = (wp >> 16) as u32;
-      if id == PAGE_LIST && notification == LBN_SELCHANGE {
+      if id == reading::BOOKMARK_LIST && notification == LBN_SELCHANGE {
+        app.reader_action(reading::BOOKMARK_LIST);
+      } else if id == PAGE_LIST && notification == LBN_SELCHANGE {
         let index = SendMessageW(app.control(PAGE_LIST), LB_GETCURSEL, 0, 0);
         if index >= 0 {
           app.navigate(index as usize);
@@ -2022,6 +2158,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       app.request_thumbnails();
       Some(0)
     }
+    WM_TIMER if wp == 6 => {
+      app.poll_reader();
+      Some(0)
+    }
+    WM_TIMER if wp == 7 => {
+      app.poll_inline();
+      Some(0)
+    }
+    WM_TIMER if wp == 8 => {
+      app.poll_updates();
+      Some(0)
+    }
+    WM_TIMER if wp == 5 => {
+      app.remember_reading();
+      app.checkpoint();
+      Some(0)
+    }
     WM_TIMER if wp == 4 => {
       app.poll_job();
       Some(0)
@@ -2034,6 +2187,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
   let result = with_app(|app| match msg {
+    WM_COMMAND if wp & 65535 == inline::INPUT && (wp >> 16) as u32 == EN_CHANGE => {
+      app.inline_change();
+      Some(0)
+    }
+    WM_COMMAND if wp & 65535 == inline::CHOICE && (wp >> 16) as u32 == CBN_SELCHANGE => {
+      app.inline_action(inline::CHOICE);
+      Some(0)
+    }
     WM_COMMAND if (wp >> 16) as u32 == BN_CLICKED => {
       app.action(wp & 0xffff);
       Some(0)
@@ -2050,7 +2211,11 @@ unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     WM_SETCURSOR if (lp & 0xffff) == HTCLIENT as isize => {
       SetCursor(LoadCursorW(
         ptr::null_mut(),
-        if app.editor.drawing() {
+        if app.review.mode.is_some() {
+          IDC_CROSS
+        } else if app.reader.text_mode {
+          IDC_IBEAM
+        } else if app.editor.drawing() {
           IDC_CROSS
         } else {
           IDC_ARROW
@@ -2068,12 +2233,19 @@ unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       Some(0)
     }
     WM_LBUTTONDOWN => {
+      if app.draft.is_some() {
+        return Some(0);
+      }
       SetFocus(hwnd);
-      app.editor_mouse(msg, lp);
+      if !app.review_mouse(msg, lp) && !app.reader_mouse(msg, lp) {
+        app.editor_mouse(msg, lp);
+      }
       Some(0)
     }
     WM_MOUSEMOVE | WM_LBUTTONUP | WM_CAPTURECHANGED => {
-      app.editor_mouse(msg, lp);
+      if !app.review_mouse(msg, lp) && !app.reader_mouse(msg, lp) {
+        app.editor_mouse(msg, lp);
+      }
       Some(0)
     }
     WM_VSCROLL | WM_HSCROLL => {
@@ -2154,17 +2326,67 @@ unsafe fn hotkey(msg: &MSG) -> bool {
   with_app(|a| {
     let key = msg.wParam as u16;
     let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
-    let edit = GetFocus() == a.control(PAGE_EDIT);
+    if a.draft.is_some() {
+      if key == VK_ESCAPE {
+        a.cancel_inline();
+        return true;
+      }
+      if ctrl && key == VK_RETURN {
+        a.inline_action(inline::APPLY);
+        return true;
+      }
+      if ctrl && key == b'S' as u16 {
+        a.action(editor::SAVE);
+        return true;
+      }
+      return false;
+    }
+    let query = GetFocus() == a.control(reading::QUERY);
+    let edit = GetFocus() == a.control(PAGE_EDIT) || query;
     let canvas_focus = GetFocus() == a.canvas || GetFocus() == a.hwnd;
     if a.dialog_open {
       return false;
     }
-    if key == VK_ESCAPE && (a.printing || a.editor.can_cancel()) {
+    if query && key == VK_RETURN {
+      a.reader_action(if GetKeyState(VK_SHIFT as i32) < 0 {
+        reading::FIND_PREV
+      } else {
+        reading::FIND_NEXT
+      });
+      return true;
+    }
+    if key == VK_F3 && a.reader.search_open {
+      a.reader_action(if GetKeyState(VK_SHIFT as i32) < 0 {
+        reading::FIND_PREV
+      } else {
+        reading::FIND_NEXT
+      });
+      return true;
+    }
+    if !edit && a.review.mode == Some(review::AREA) {
+      if key == VK_RETURN {
+        a.review_finish();
+        return true;
+      }
+      if key == VK_BACK {
+        a.review_backspace();
+        return true;
+      }
+    }
+    if key == VK_ESCAPE && a.reader.search_open {
+      a.reader_action(reading::FIND_CLOSE);
+      return true;
+    }
+    if key == VK_ESCAPE
+      && (a.printing || a.editor.can_cancel() || a.reader.text_mode || a.review.can_cancel())
+    {
       a.action(CANCEL);
       return true;
     }
     if key == VK_DELETE && !edit {
-      a.action(if a.editor.selection_is_mask() {
+      a.action(if a.review.has_selection() {
+        review::REMOVE
+      } else if a.editor.selection_is_mask() {
         editor::MASK_DELETE
       } else {
         editor::DELETE
@@ -2188,6 +2410,8 @@ unsafe fn hotkey(msg: &MSG) -> bool {
     }
     let id = if ctrl {
       match key {
+        0x46 => Some(reading::FIND),
+        0x43 if !edit => Some(reading::COPY),
         0x4f => Some(OPEN),
         0x50 => Some(PRINT),
         0x53 => Some(if GetKeyState(VK_SHIFT as i32) < 0 {
@@ -2200,7 +2424,12 @@ unsafe fn hotkey(msg: &MSG) -> bool {
         0x30 => Some(FIT),
         0x32 => Some(WIDTH),
         0x52 => Some(ROTATE),
-        0x5a if !edit => Some(editor::UNDO),
+        0x5a if !edit => Some(if GetKeyState(VK_SHIFT as i32) < 0 {
+          editor::REDO
+        } else {
+          editor::UNDO
+        }),
+        0x59 if !edit => Some(editor::REDO),
         _ => None,
       }
     } else if !edit {
@@ -2216,7 +2445,7 @@ unsafe fn hotkey(msg: &MSG) -> bool {
       a.action(id);
       return true;
     }
-    if edit && key == VK_RETURN {
+    if edit && !query && key == VK_RETURN {
       let mut value = [0u16; 32];
       let len = GetWindowTextW(a.control(PAGE_EDIT), value.as_mut_ptr(), 32);
       if let Ok(page) = String::from_utf16_lossy(&value[..len.max(0) as usize]).parse::<usize>() {
@@ -2292,6 +2521,15 @@ pub fn run(
     let worker = Worker::start(hwnd as usize, dll);
     let mut app = App {
       editor: editor::Editor::default(),
+      draft: None,
+      updates: updates::Updates::default(),
+      reader: reading::Reader::default(),
+      review: review::Review::default(),
+      recent: crate::preferences::read(),
+      pending_recent: None,
+      pending_insert: None,
+      drag_page: None,
+      page_drag_message: RegisterWindowMessageW(DRAGLISTMSGSTRING),
       tool_labels: Vec::new(),
       hwnd,
       canvas: ptr::null_mut(),
@@ -2376,6 +2614,8 @@ pub fn run(
     if let Some(path) = path {
       with_app(|a| a.open(path));
     }
+    SetTimer(hwnd, 5, 500, None);
+    PostMessageW(hwnd, WM_APP + 24, 0, 0);
     let mut msg: MSG = std::mem::zeroed();
     while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
       if !hotkey(&msg) && IsDialogMessageW(hwnd, &msg) == 0 {

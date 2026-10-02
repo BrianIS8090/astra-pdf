@@ -2,6 +2,127 @@ use super::*;
 use crate::editing::{Operation, PageObject};
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct Matrix(pub [f32; 6]);
+impl Matrix {
+  fn point(self, x: f32, y: f32) -> (f32, f32) {
+    let [a, b, c, d, e, f] = self.0;
+    (a * x + c * y + e, b * x + d * y + f)
+  }
+  pub(super) fn compose(self, child: Self) -> Self {
+    let [a, b, c, d, e, f] = child.0;
+    let (x, y) = self.point(e, f);
+    let [p, q, r, s, _, _] = self.0;
+    Self([
+      p * a + r * b,
+      q * a + s * b,
+      p * c + r * d,
+      q * c + s * d,
+      x,
+      y,
+    ])
+  }
+  pub(super) fn inverse(self) -> Result<Self, String> {
+    let [a, b, c, d, e, f] = self.0;
+    let determinant = a * d - b * c;
+    if !determinant.is_finite() || determinant.abs() < 1e-12 {
+      return Err("Вырожденное преобразование PDF.".into());
+    }
+    Ok(Self([
+      d / determinant,
+      -b / determinant,
+      -c / determinant,
+      a / determinant,
+      (c * f - d * e) / determinant,
+      (b * e - a * f) / determinant,
+    ]))
+  }
+}
+
+impl Pdf {
+  pub(super) unsafe fn object_at(&self, page: Handle, path: &[usize]) -> Result<Handle, String> {
+    let get = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle, i32) -> Handle>(b"FPDFPage_GetObject\0")
+      .map_err(|e| e.to_string())?;
+    let child = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle, u32) -> Handle>(b"FPDFFormObj_GetObject\0")
+      .map_err(|e| e.to_string())?;
+    let mut object = get(page, *path.first().ok_or("Объект отсутствует.")? as i32);
+    for index in path.iter().skip(1) {
+      object = child(object, *index as u32);
+    }
+    if object.is_null() {
+      Err("Объект отсутствует.".into())
+    } else {
+      Ok(object)
+    }
+  }
+  pub(super) unsafe fn object_tree(
+    &self,
+    page: Handle,
+  ) -> Result<Vec<(Handle, Vec<usize>, Matrix)>, String> {
+    let count = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle) -> i32>(b"FPDFPage_CountObjects\0")
+      .map_err(|e| e.to_string())?;
+    let children = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle) -> i32>(b"FPDFFormObj_CountObjects\0")
+      .map_err(|e| e.to_string())?;
+    let kind = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle) -> i32>(b"FPDFPageObj_GetType\0")
+      .map_err(|e| e.to_string())?;
+    let matrix = *self
+      .api
+      ._library
+      .get::<unsafe extern "C" fn(Handle, *mut Matrix) -> i32>(b"FPDFPageObj_GetMatrix\0")
+      .map_err(|e| e.to_string())?;
+    let n = count(page);
+    if !(0..=100_000).contains(&n) {
+      return Err("Слишком много объектов.".into());
+    }
+    let identity = Matrix([1., 0., 0., 1., 0., 0.]);
+    let mut out = Vec::new();
+    for i in 0..n {
+      out.push((
+        self.object_at(page, &[i as usize])?,
+        vec![i as usize],
+        identity,
+      ));
+    }
+    let mut at = 0;
+    while at < out.len() {
+      let (object, path, parent) = out[at].clone();
+      if kind(object) == 5 {
+        let n = children(object);
+        if n < 0 || out.len() + n as usize > 100_000 || path.len() > 32 {
+          return Err("Слишком сложная группа PDF.".into());
+        }
+        let mut local = identity;
+        if matrix(object, &mut local) == 0 {
+          return Err("Не удалось прочитать координаты группы.".into());
+        }
+        for i in 0..n {
+          let mut path = path.clone();
+          path.push(i as usize);
+          out.push((self.object_at(page, &path)?, path, parent.compose(local)));
+        }
+      }
+      at += 1;
+    }
+    Ok(out)
+  }
+}
+
+#[repr(C)]
 struct Output {
   version: i32,
   write: unsafe extern "C" fn(*mut Output, *const c_void, u32) -> i32,
@@ -41,10 +162,67 @@ pub(super) fn save_document(pdf: &Pdf) -> Result<Vec<u8>, String> {
 
 impl Pdf {
   pub fn edit(&self, operation: &Operation) -> Result<Vec<u8>, String> {
+    match operation {
+      Operation::FontText {
+        page,
+        object,
+        text,
+        font,
+      } => return self.replace_text_font(*page, *object, text, Some(font)),
+      Operation::NoteDelete { page, index } => return self.edit_note(*page, *index, None),
+      Operation::NoteText { page, index, text } => {
+        return self.edit_note(*page, *index, Some(text))
+      }
+      Operation::Annotate { note } => return self.annotate(note),
+      Operation::PageOrder { order } => return crate::pages::reorder(&self._bytes, order),
+      Operation::InsertPages { source, range, at } => {
+        return crate::pages::insert(
+          &self._bytes,
+          &crate::export::read(source, crate::vault::LIMIT)?,
+          range,
+          *at,
+        )
+      }
+      Operation::ReadPage { page } => {
+        return serde_json::to_vec(&self.read_page(*page)?).map_err(|e| e.to_string())
+      }
+      Operation::Find { query, masks } => {
+        return serde_json::to_vec(&self.search(query, masks)?).map_err(|e| e.to_string())
+      }
+      Operation::Bookmarks => {
+        return serde_json::to_vec(&self.bookmarks()?).map_err(|e| e.to_string())
+      }
+      _ => (),
+    }
     if let Operation::Text { page, object, text } = operation {
       return self.replace_text(*page, *object, text);
     }
-    if let Operation::Delete { page, .. } = operation {
+    if let Operation::Transform {
+      page,
+      object,
+      bounds,
+    } = operation
+    {
+      let objects: Vec<PageObject> =
+        serde_json::from_slice(&self.edit(&Operation::Objects { page: *page })?)
+          .map_err(|e| e.to_string())?;
+      if let Some(item) = objects.iter().find(|o| o.index == *object && o.kind == 1) {
+        return self.transform_text(*page, item, bounds);
+      }
+    }
+    if let Operation::Delete { page, object } = operation {
+      let objects: Vec<PageObject> =
+        serde_json::from_slice(&self.edit(&Operation::Objects { page: *page })?)
+          .map_err(|e| e.to_string())?;
+      if objects
+        .iter()
+        .find(|o| o.index == *object)
+        .is_some_and(|o| o.path.len() > 1 && o.kind == 1)
+      {
+        return self.replace_text(*page, *object, "");
+      }
+    }
+    if let Operation::Delete { page, .. } | Operation::Transform { page, .. } = operation {
       let bytes = crate::editing::separate_streams(&self._bytes, *page)?;
       let prepared = Pdf::open(self.api.clone(), Arc::new(bytes))?;
       return crate::editing::retain_state_fonts(
@@ -62,6 +240,7 @@ impl Pdf {
     let index = match operation {
       Operation::Objects { page }
       | Operation::Delete { page, .. }
+      | Operation::Transform { page, .. }
       | Operation::Text { page, .. } => *page,
       _ => unreachable!(),
     };
@@ -147,12 +326,27 @@ impl Pdf {
             }
           }
           let mut objects = Vec::new();
-          for i in 0..n {
-            let object = get(page, i);
+          for (i, (object, path, parent)) in self.object_tree(page)?.into_iter().enumerate() {
             let (mut l, mut b, mut r, mut t) = (0., 0., 0., 0.);
             if bounds(object, &mut l, &mut b, &mut r, &mut t) == 0 {
               continue;
             }
+            let corners = [
+              parent.point(l, b),
+              parent.point(l, t),
+              parent.point(r, b),
+              parent.point(r, t),
+            ];
+            l = corners.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+            r = corners
+              .iter()
+              .map(|p| p.0)
+              .fold(f32::NEG_INFINITY, f32::max);
+            b = corners.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+            t = corners
+              .iter()
+              .map(|p| p.1)
+              .fold(f32::NEG_INFINITY, f32::max);
             let (mut x1, mut y1, mut x2, mut y2) = (0, 0, 0, 0);
             if device(
               page, 0, 0, 1_000_000, 1_000_000, 0, l as f64, b as f64, &mut x1, &mut y1,
@@ -165,8 +359,28 @@ impl Pdf {
             }
             let object_kind = kind(object);
             let value = texts.remove(&(object as usize)).unwrap_or_default();
+            let mut font = String::new();
+            let mut font_size = 0.;
+            if object_kind == 1 {
+              let handle = sym!(
+                "FPDFTextObj_GetFont",
+                unsafe extern "C" fn(Handle) -> Handle
+              )(object);
+              let mut name = [0u8; 256];
+              let length = sym!(
+                "FPDFFont_GetBaseFontName",
+                unsafe extern "C" fn(Handle, *mut u8, usize) -> usize
+              )(handle, name.as_mut_ptr(), name.len());
+              if length > 0 && length <= name.len() {
+                font = String::from_utf8_lossy(&name[..length - 1]).into_owned();
+              }
+              sym!(
+                "FPDFTextObj_GetFontSize",
+                unsafe extern "C" fn(Handle, *mut f32) -> i32
+              )(object, &mut font_size);
+            }
             objects.push(PageObject {
-              index: i as usize,
+              index: i,
               kind: object_kind,
               bounds: [
                 x1.min(x2) as f64 / 1_000_000.,
@@ -175,17 +389,22 @@ impl Pdf {
                 y1.max(y2) as f64 / 1_000_000.,
               ],
               text: value,
+              path,
+              font,
+              font_size,
             });
           }
           close_text(text_page);
           return serde_json::to_vec(&objects).map_err(|e| e.to_string());
         }
         let object_index = match operation {
-          Operation::Delete { object, .. } | Operation::Text { object, .. } => *object,
+          Operation::Delete { object, .. }
+          | Operation::Text { object, .. }
+          | Operation::Transform { object, .. } => *object,
           _ => unreachable!(),
         };
         if object_index >= n as usize {
-          return Err("Объект отсутствует. Выберите его повторно.".into());
+          return Err("Отдельный нетекстовый элемент внутри группы пока не редактируется. Выберите всю группу повторным щелчком.".into());
         }
         let object = get(page, object_index as i32);
         let mode = sym!(
@@ -198,10 +417,83 @@ impl Pdf {
               .into(),
           );
         }
-        if remove(page, object) == 0 {
-          return Err("Не удалось удалить объект.".into());
+        if let Operation::Transform { bounds: target, .. } = operation {
+          if target
+            .iter()
+            .any(|v| !v.is_finite() || !(-5. ..=6.).contains(v))
+            || target[2] - target[0] < 0.000001
+            || target[3] - target[1] < 0.000001
+          {
+            return Err("Недопустимый размер или положение объекта.".into());
+          }
+          let (mut l, mut b, mut r, mut t) = (0., 0., 0., 0.);
+          if bounds(object, &mut l, &mut b, &mut r, &mut t) == 0 || r - l < 0.001 || t - b < 0.001 {
+            return Err("Невозможно изменить размер вырожденного объекта.".into());
+          }
+          let to_page = sym!(
+            "FPDF_DeviceToPage",
+            unsafe extern "C" fn(
+              Handle,
+              i32,
+              i32,
+              i32,
+              i32,
+              i32,
+              i32,
+              i32,
+              *mut f64,
+              *mut f64,
+            ) -> i32
+          );
+          let (mut x1, mut y1, mut x2, mut y2) = (0., 0., 0., 0.);
+          if to_page(
+            page,
+            0,
+            0,
+            1_000_000,
+            1_000_000,
+            0,
+            (target[0] * 1_000_000.).round() as i32,
+            (target[1] * 1_000_000.).round() as i32,
+            &mut x1,
+            &mut y1,
+          ) == 0
+            || to_page(
+              page,
+              0,
+              0,
+              1_000_000,
+              1_000_000,
+              0,
+              (target[2] * 1_000_000.).round() as i32,
+              (target[3] * 1_000_000.).round() as i32,
+              &mut x2,
+              &mut y2,
+            ) == 0
+          {
+            return Err("Не удалось преобразовать координаты объекта.".into());
+          }
+          let sx = (x2 - x1).abs() / (r - l) as f64;
+          let sy = (y2 - y1).abs() / (t - b) as f64;
+          if !(0.02..=50.).contains(&sx) || !(0.02..=50.).contains(&sy) {
+            return Err("Изменяйте размер в пределах от 2% до 5000% за один шаг.".into());
+          }
+          let dx = x1.min(x2) - l as f64 * sx;
+          let dy = y1.min(y2) - b as f64 * sy;
+          sym!(
+            "FPDFPageObj_Transform",
+            unsafe extern "C" fn(Handle, f64, f64, f64, f64, f64, f64)
+          )(object, sx, 0., 0., sy, dx, dy);
+          sym!(
+            "FPDFPageObj_TransformClipPath",
+            unsafe extern "C" fn(Handle, f64, f64, f64, f64, f64, f64)
+          )(object, sx, 0., 0., sy, dx, dy);
+        } else {
+          if remove(page, object) == 0 {
+            return Err("Не удалось удалить объект.".into());
+          }
+          destroy(object);
         }
-        destroy(object);
         if generate(page) == 0 {
           return Err("Не удалось обновить содержимое страницы.".into());
         }
@@ -216,6 +508,133 @@ impl Pdf {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn nested_repeated_group_edits_only_selected_instance() {
+    use lopdf::{dictionary, Stream};
+    let mut doc = lopdf::Document::load_mem(&with_content(
+      b"q 1 0 0 1 30 400 cm /Group Do Q q 1 0 0 1 30 200 cm /Group Do Q",
+    ))
+    .unwrap();
+    let page = doc.get_pages()[&1];
+    let mut resources = super::super::groups::resources(&doc, page).unwrap();
+    let form=doc.add_object(Stream::new(dictionary!{"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),300.into(),100.into()],"Resources"=>resources.clone(),"Group"=>dictionary!{"S"=>"Transparency","I"=>true}},b"BT /F1 18 Tf 10 30 Td (OLD WORD) Tj ET".to_vec()));
+    resources.set("XObject", dictionary! {"Group"=>form});
+    doc
+      .get_object_mut(page)
+      .unwrap()
+      .as_dict_mut()
+      .unwrap()
+      .set("Resources", resources);
+    let mut source = Vec::new();
+    doc.save_to(&mut source).unwrap();
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(source)).unwrap();
+    let items: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let children: Vec<_> = items.iter().filter(|o| o.kind == 1).collect();
+    assert_eq!(children.len(), 2);
+    assert!(children[0].bounds[1] < children[1].bounds[1]);
+    assert_eq!(children[0].path, vec![0, 0]);
+    let bytes = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: children[0].index,
+        text: "NEW WORD\nMORE".into(),
+      })
+      .unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(bytes.clone())).unwrap();
+    let result: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let text: Vec<_> = result
+      .iter()
+      .filter(|o| o.kind == 1)
+      .map(|o| o.text.as_str())
+      .collect();
+    assert_eq!(text, vec!["NEW WORD", "MORE", "OLD WORD"]);
+    let doc = lopdf::Document::load_mem(&bytes).unwrap();
+    assert!(doc
+      .objects
+      .values()
+      .filter_map(|o| o.as_stream().ok())
+      .any(|s| s.dict.has(b"Group")));
+    assert_eq!(result.last().unwrap().bounds, children[1].bounds);
+    let removed = pdf
+      .edit(&Operation::Delete {
+        page: 0,
+        object: result.iter().find(|o| o.text == "MORE").unwrap().index,
+      })
+      .unwrap();
+    let check = Pdf::open(api, Arc::new(removed)).unwrap();
+    let items: Vec<PageObject> =
+      serde_json::from_slice(&check.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(
+      items
+        .iter()
+        .filter(|o| o.kind == 1)
+        .map(|o| o.text.as_str())
+        .collect::<Vec<_>>(),
+      vec!["NEW WORD", "OLD WORD"]
+    );
+  }
+  #[test]
+  fn explicit_font_choice_embeds_cyrillic_and_preserves_neighbors() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(
+      api.clone(),
+      Arc::new(with_content(
+        b"BT /F1 18 Tf 2 Tc 3 Tw 50 650 Td (OLD WORD) Tj (KEEP) Tj ET",
+      )),
+    )
+    .unwrap();
+    let before: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let font =
+      std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap()).join("Fonts/arial.ttf");
+    let bytes = pdf
+      .edit(&Operation::FontText {
+        page: 0,
+        object: 0,
+        text: "Новый текст\nВторая строка".into(),
+        font,
+      })
+      .unwrap();
+    let edited = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+    let after: Vec<PageObject> =
+      serde_json::from_slice(&edited.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert_eq!(after[0].text, "Новый текст");
+    assert_eq!(after[1].text, "Вторая строка");
+    assert_eq!(after[2].text, "KEEP");
+    assert!(after[0].font.contains("Arial"));
+    for (a, b) in after[2].bounds.iter().zip(before[1].bounds) {
+      assert!((a - b).abs() < 0.00001)
+    }
+    let b = after[0].bounds;
+    let target = [b[0] + 0.03, b[1] + 0.02, b[2] + 0.03, b[3] + 0.02];
+    let moved = edited
+      .edit(&Operation::Transform {
+        page: 0,
+        object: 0,
+        bounds: target,
+      })
+      .unwrap();
+    let check = Pdf::open(api, Arc::new(moved)).unwrap();
+    let items: Vec<PageObject> =
+      serde_json::from_slice(&check.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    for (a, b) in items[0].bounds.iter().zip(target) {
+      assert!(
+        (a - b).abs() < 0.00001,
+        "actual {:?}, target {:?}",
+        items[0].bounds,
+        target
+      )
+    }
+    for (a, b) in items.iter().skip(1).zip(after.iter().skip(1)) {
+      assert_eq!(a.text, b.text);
+      for (x, y) in a.bounds.iter().zip(b.bounds) {
+        assert!((x - y).abs() < 0.00001)
+      }
+    }
+  }
   fn with_content(content: &[u8]) -> Vec<u8> {
     let mut doc = lopdf::Document::load_mem(&crate::fixture::demo()).unwrap();
     let page = doc.get_pages()[&1];
@@ -660,5 +1079,97 @@ mod tests {
       .iter()
       .any(|o| o.text.replace('\u{a0}', " ") == "Проверка 123"));
     deleted.render(0, 300, 400, 0, false).unwrap();
+  }
+
+  #[test]
+  fn multiline_text_in_layer_preserves_neighbors_and_layer_visibility() {
+    let mut d = lopdf::Document::load_mem(&crate::fixture::demo()).unwrap();
+    let page = d.get_pages()[&1];
+    let contents = d.get_page_content(page);
+    let mut changed=b"BT /F1 10 Tf 30 80 Td (Neighbor before) Tj ET\n/OC /Electric BDC BT /F1 18 Tf 50 400 Td (First) Tj 0 -100 Td (Neighbor after) Tj ET EMC\n".to_vec();
+    changed.extend_from_slice(&contents);
+    let stream = d.add_object(lopdf::Stream::new(lopdf::dictionary! {}, changed));
+    d.get_object_mut(page)
+      .unwrap()
+      .as_dict_mut()
+      .unwrap()
+      .set("Contents", stream);
+    let mut bytes = Vec::new();
+    d.save_to(&mut bytes).unwrap();
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+    let original: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    let selected = original.iter().find(|o| o.text == "First").unwrap();
+    let edited = pdf
+      .edit(&Operation::Text {
+        page: 0,
+        object: selected.index,
+        text: "First line\nSecond line\nThird".into(),
+      })
+      .unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(edited.clone())).unwrap();
+    let items: Vec<PageObject> =
+      serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+    assert!(items.iter().any(|o| o.text == "Second line"));
+    for old in original.iter().filter(|o| o.text.starts_with("Neighbor")) {
+      let new = items.iter().find(|o| o.text == old.text).unwrap();
+      assert_eq!(old.bounds, new.bounds);
+    }
+    let layers = crate::layers::Layers::read(&edited).unwrap();
+    assert_eq!(layers.items.len(), 3);
+    let hidden = Pdf::open(
+      api,
+      Arc::new(layers.with_states(&[true, false, true]).unwrap()),
+    )
+    .unwrap();
+    assert_ne!(
+      hidden.render(0, 300, 400, 0, false).unwrap().pixels,
+      pdf.render(0, 300, 400, 0, false).unwrap().pixels
+    );
+  }
+
+  #[test]
+  fn object_move_resize_preserves_neighbors_at_intrinsic_rotations() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    for rotation in [0, 90, 180, 270] {
+      let mut d = lopdf::Document::load_mem(&with_content(
+        b"0 0 1 rg 40 80 100 90 re f BT /F1 12 Tf 300 600 Td (Neighbor) Tj ET",
+      ))
+      .unwrap();
+      let id = d.get_pages()[&1];
+      d.get_object_mut(id)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Rotate", rotation);
+      let mut bytes = Vec::new();
+      d.save_to(&mut bytes).unwrap();
+      let pdf = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+      let items: Vec<PageObject> =
+        serde_json::from_slice(&pdf.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+      let rect = &items[0];
+      let b = rect.bounds;
+      let target = [
+        b[0] + 0.05,
+        b[1] + 0.03,
+        b[0] + 0.05 + (b[2] - b[0]) * 1.2,
+        b[1] + 0.03 + (b[3] - b[1]) * 0.8,
+      ];
+      let bytes = pdf
+        .edit(&Operation::Transform {
+          page: 0,
+          object: rect.index,
+          bounds: target,
+        })
+        .unwrap();
+      let after = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
+      let changed: Vec<PageObject> =
+        serde_json::from_slice(&after.edit(&Operation::Objects { page: 0 }).unwrap()).unwrap();
+      assert_eq!(changed[1].bounds, items[1].bounds);
+      for (x, y) in changed[0].bounds.iter().zip(target) {
+        assert!((x - y).abs() < 0.00001, "{rotation}: {x} != {y}");
+      }
+    }
   }
 }

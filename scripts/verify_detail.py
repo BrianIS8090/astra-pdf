@@ -52,7 +52,12 @@ def run(exe, output, documents):
         state = viewer.ready()
         elapsed = (time.perf_counter() - begun) * 1000
         assert state['scale'] >= target - .001 and not state['error']
-        assert state['tiles_visible'] > 0 and state['tiles_ready'] == state['tiles_visible']
+        _, _, width, height = next(p for p in state['page_boxes'] if p[0] == state['page'])
+        if width * height <= 8_000_000:
+          # Небольшая страница уже рисуется целиком в нужном разрешении.
+          assert state['image_size'] == [width, height] and state['tiles_visible'] == 0
+        else:
+          assert state['tiles_visible'] > 0 and state['tiles_ready'] == state['tiles_visible']
         assert state['tile_bytes'] <= 64 * 1024 * 1024
         measurements['zoom'].append({'scale': state['scale'], 'burst_and_detail_ms': round(elapsed), 'tiles': state['tiles_ready'], 'tile_bytes': state['tile_bytes']})
         if target == 64.:

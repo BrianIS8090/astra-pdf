@@ -3,6 +3,45 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Operation {
+  FontText {
+    page: usize,
+    object: usize,
+    text: String,
+    font: std::path::PathBuf,
+  },
+  NoteDelete {
+    page: usize,
+    index: usize,
+  },
+  NoteText {
+    page: usize,
+    index: usize,
+    text: String,
+  },
+  Annotate {
+    note: crate::annotation::Note,
+  },
+  Transform {
+    page: usize,
+    object: usize,
+    bounds: [f64; 4],
+  },
+  PageOrder {
+    order: Vec<usize>,
+  },
+  InsertPages {
+    source: std::path::PathBuf,
+    range: String,
+    at: usize,
+  },
+  ReadPage {
+    page: usize,
+  },
+  Find {
+    query: String,
+    masks: Vec<Mask>,
+  },
+  Bookmarks,
   Objects {
     page: usize,
   },
@@ -26,9 +65,15 @@ pub struct PageObject {
   pub kind: i32,
   pub bounds: [f64; 4],
   pub text: String,
+  #[serde(default)]
+  pub path: Vec<usize>,
+  #[serde(default)]
+  pub font: String,
+  #[serde(default)]
+  pub font_size: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mask {
   pub page: usize,
   pub bounds: [f64; 4],
@@ -180,11 +225,15 @@ pub fn separate_streams(bytes: &[u8], page: usize) -> Result<Vec<u8>, String> {
   let mut in_text = false;
   let mut in_path = false;
   let mut text_state = Vec::new();
+  let mut text_stack = Vec::new();
   for operation in parsed.operations {
     let name = operation.operator.as_str();
     if in_text {
       match name {
         "ET" => {
+          if !text_stack.is_empty() {
+            return Err("Незавершённое состояние внутри текста PDF.".into());
+          }
           chunk.push(operation);
           flush(&mut doc, &mut streams, &mut chunk)?;
           // Удаление текста не должно менять унаследованный шрифт и цвет соседей.
@@ -209,6 +258,18 @@ pub fn separate_streams(bytes: &[u8], page: usize) -> Result<Vec<u8>, String> {
           text_state.push(Op::new("Tc", vec![operation.operands[1].clone()]));
         }
         "Tj" | "TJ" | "'" | "Td" | "Tm" | "T*" => {}
+        "BMC" | "BDC" | "EMC" => {}
+        "q" => {
+          if text_stack.len() > 1024 {
+            return Err("Слишком глубокое состояние текста.".into());
+          }
+          text_stack.push(text_state.clone());
+        }
+        "Q" => {
+          text_state = text_stack
+            .pop()
+            .ok_or("Несогласованное состояние текста PDF.")?;
+        }
         _ => {
           return Err(
             "Сложная структура текстового блока пока не поддерживает безопасное редактирование."

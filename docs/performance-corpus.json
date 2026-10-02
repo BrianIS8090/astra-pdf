@@ -1,0 +1,31 @@
+{
+  "purpose": "Постоянный набор реальных PDF для сравнения открытия, масштаба и памяти",
+  "private_documents_included": false,
+  "documents": [
+    {
+      "id": "lighting-11",
+      "description": "Светотехнический альбом с кириллицей, таблицами и изображениями",
+      "pages": 11,
+      "bytes": 930656,
+      "sha256": "66b288f4c3d37b5729dbb97f5f710ec6cfe6d27e2d01a7c140f4344190d506f6"
+    },
+    {
+      "id": "technical-48",
+      "description": "Большой технический альбом с чертежами и встроенными шрифтами",
+      "pages": 48,
+      "bytes": 9176575,
+      "sha256": "287e23bbc21dc7c5f8c1d1fa7d705e224712d37218d0d0f1b366a9e912cb251e"
+    },
+    {
+      "id": "drawing-a1-25layers",
+      "description": "Архитектурный чертёж A1 с 25 слоями",
+      "pages": 1,
+      "layers": 25,
+      "bytes": 696254,
+      "sha256": "280b160446c1ce07fc2d7e86577bc105deb8c4799a197943c2a3de0a2b9bf4d2"
+    }
+  ],
+  "procedure": "Передать локальные пути трёх совпадающих по SHA-256 PDF в scripts/verify.ps1 через -ExtraPdf. Сравнивать один компьютер и порядок документов. Исходные PDF и полные локальные отчёты не публиковать.",
+  "metrics": ["first_frame_ms", "burst_and_detail_ms", "new_area_ms", "cached_area_ms", "peak_working_set_bytes"],
+  "conditions": "Windows 11 x64, одинаковая ширина окна, прогретая файловая система. Значения — измерения одной конфигурации, не гарантированное время на других компьютерах."
+}

@@ -1,12 +1,16 @@
 use crate::{export, vault};
 use sha2::{Digest, Sha256};
 use std::{
+  fs::{File, OpenOptions},
+  io::Write,
+  os::windows::fs::OpenOptionsExt,
   path::{Path, PathBuf},
   sync::Arc,
 };
 
 // Снимки принадлежат сеансу: пользовательские PDF создаются только при сохранении.
 pub struct Revision {
+  _file: File,
   pub path: PathBuf,
   pub hash: [u8; 32],
   pub size: usize,
@@ -20,8 +24,22 @@ impl Revision {
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let token = vault::random::<16>()?.map(|b| format!("{b:02x}")).join("");
     let path = root.join(format!("{token}.pdf"));
-    export::write(&path, bytes)?;
+    // Windows удалит рабочий файл после последнего закрытого дескриптора,
+    // в том числе при аварийном завершении процесса. Восстановление хранится отдельно зашифрованным.
+    let mut file = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create_new(true)
+      .custom_flags(
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE
+          | windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY,
+      )
+      .open(&path)
+      .map_err(|e| e.to_string())?;
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
     Ok(Arc::new(Self {
+      _file: file,
       path,
       hash: Sha256::digest(bytes).into(),
       size: bytes.len(),
@@ -105,17 +123,20 @@ mod tests {
   fn revisions_live_until_last_owner_and_save_preserves_undo() {
     let before = Revision::new(b"before").unwrap();
     let after = Revision::new(b"after").unwrap();
-    let target = Revision::new(b"before").unwrap();
+    let target =
+      std::env::temp_dir().join(format!("astra-session-save-{}.pdf", std::process::id()));
+    std::fs::write(&target, b"before").unwrap();
     let mut session = Session {
       current: after.clone(),
       saved_hash: before.hash,
     };
     assert!(session.dirty());
-    session.saved_hash = save(&after.path, &target.path, Some(before.hash), || false).unwrap();
+    session.saved_hash = save(&after.path, &target, Some(before.hash), || false).unwrap();
     assert!(!session.dirty());
     session.current = before.clone();
     assert!(session.dirty());
-    assert_eq!(std::fs::read(&target.path).unwrap(), b"after");
+    assert_eq!(std::fs::read(&target).unwrap(), b"after");
+    std::fs::remove_file(target).unwrap();
     let path = after.path.clone();
     drop(after);
     assert!(!path.exists());
