@@ -19,6 +19,7 @@ mod printing;
 mod reading;
 mod recovery;
 mod session;
+mod theme;
 mod ui;
 mod updates;
 mod vault;
