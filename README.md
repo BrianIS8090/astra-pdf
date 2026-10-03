@@ -7,15 +7,15 @@
 <p align="center">Просмотр и редактирование PDF для Windows 11 · Rust · PDFium</p>
 
 <p align="center">
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/tag/v0.10.0-alpha.3"><img src="https://img.shields.io/badge/версия-0.10.0--alpha.3-16758a" alt="Предварительный выпуск 0.10.0-alpha.3"></a>
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/tag/v0.10.0-alpha.4"><img src="https://img.shields.io/badge/версия-0.10.0--alpha.4-16758a" alt="Предварительный выпуск 0.10.0-alpha.4"></a>
   <img src="https://img.shields.io/badge/Windows_11-x64-0078d4" alt="Windows 11 x64">
   <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-25866a" alt="Лицензия MIT"></a>
   <a href="https://github.com/BrianIS8090/astra-pdf/actions/workflows/windows.yml"><img src="https://github.com/BrianIS8090/astra-pdf/actions/workflows/windows.yml/badge.svg" alt="Проверки Windows"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v0.10.0-alpha.3/AstraPDF-0.10.0-alpha.3-setup-x64.exe"><b>Установить для Windows 11</b></a> ·
-  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v0.10.0-alpha.3/AstraPDF-0.10.0-alpha.3-win-x64.zip">Переносимый ZIP</a> ·
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v0.10.0-alpha.4/AstraPDF-0.10.0-alpha.4-setup-x64.exe"><b>Установить для Windows 11</b></a> ·
+  <a href="https://github.com/BrianIS8090/astra-pdf/releases/download/v0.10.0-alpha.4/AstraPDF-0.10.0-alpha.4-win-x64.zip">Переносимый ZIP</a> ·
   <a href="CHANGELOG.md">Что нового</a> ·
   <a href="TEST_REPORT.md">Результаты проверки</a> ·
   <a href="https://github.com/BrianIS8090/astra-pdf/issues/new/choose">Сообщить о проблеме</a>
@@ -23,7 +23,7 @@
 
 Нативный просмотрщик и редактор PDF для Windows 11 x64. Работайте с многостраничными документами и слоями, рассматривайте детали чертежей, исправляйте отдельные строки и сохраняйте выбранные страницы. Интерфейс написан на Rust; страницы рисует PDFium. Браузерный движок и .NET для работы приложения не нужны. Документы обрабатываются локально.
 
-**0.10.0-alpha.3 — предварительный выпуск.** Автоматические и интерактивные проверки описаны в [отчёте](TEST_REPORT.md). Сохранение выбранного диапазона через системный диалог печати ещё требует окончательной проверки; совместимость со всеми принтерами и компьютерами не подтверждена.
+**0.10.0-alpha.4 — предварительный выпуск.** Автоматические и интерактивные проверки описаны в [отчёте](TEST_REPORT.md). Сохранение выбранного диапазона через системный диалог печати ещё требует окончательной проверки; совместимость со всеми принтерами и компьютерами не подтверждена.
 
 ![Astra PDF 0.10.0-alpha.3: тёмная тема, миниатюры и непрерывная прокрутка](docs/images/viewer-dark-alpha3.jpg)
 
@@ -36,7 +36,13 @@
 
 Обзор обеих тем снят в **0.10.0-alpha.3** в настоящем окне Windows. Остальные иллюстрации относятся к alpha.1. На публичных снимках используются собственные демонстрационные PDF с вымышленными данными.
 
-### Новое в 0.10.0-alpha.3
+### Новое в 0.10.0-alpha.4
+
+- Исправлено наложение старых и новых букв при вводе, удалении и замене текста в редакторе. Исправление работает в обеих темах и не запускает повторную отрисовку PDF.
+- Та же коррекция применяется к полю поиска, номеру страницы и текстовым полям собственных диалогов.
+- Добавлена проверка, воспроизводящая ошибку на прежнем коде; полный набор автоматических проверок прошёл. Живая визуальная проверка этого исправления остаётся незавершённой — подробнее в [отчёте](TEST_REPORT.md).
+
+### Темы, добавленные в 0.10.0-alpha.3
 
 - **Тёмная и светлая темы:** кнопка солнца/луны справа в верхней панели или **Вид → Тёмная тема**. Выбор сохраняется после закрытия программы.
 - Панели, кнопки, миниатюры, поля, списки, меню и собственные диалоги используют общую палитру.
