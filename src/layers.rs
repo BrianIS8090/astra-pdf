@@ -1,6 +1,6 @@
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
   pub id: ObjectId,
   pub name: String,

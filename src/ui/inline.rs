@@ -23,6 +23,7 @@ struct Preview {
   before: Arc<Revision>,
   after: Arc<Revision>,
   image: Raster,
+  key: RenderKey,
 }
 pub(super) struct Draft {
   page: usize,
@@ -335,8 +336,16 @@ impl App {
     if d.apply && d.preview.is_some() {
       let preview = d.preview.take().unwrap();
       let save = d.save;
+      let page = d.page;
       self.cancel_inline();
-      self.commit_revision(preview.before, preview.after);
+      self.commit_revision(preview.before, preview.after, page);
+      // Готовый предпросмотр уже содержит применённый текст: не возвращаем старую строку.
+      if preview.key.states == self.states && preview.key.rotation == self.rotation {
+        self.frames.finish_page(page);
+        self.details.finish_page(page);
+        self.frames.put(preview.key, preview.image);
+        self.request();
+      }
       if save {
         PostMessageW(self.hwnd, WM_APP + 21, editor::SAVE, 0);
       }
@@ -402,6 +411,7 @@ impl App {
           before,
           after,
           image,
+          key,
         })
       })();
       let _ = sender.send(result);

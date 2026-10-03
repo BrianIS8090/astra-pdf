@@ -47,10 +47,16 @@ enum Mode {
   Pixelate,
   Masks,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Change {
+  Overlays,
+  Page(usize),
+  Document,
+}
 enum MaskUndo {
   Added(usize),
   Removed(usize, Mask),
-  Document(Arc<Revision>, Vec<Mask>, &'static str),
+  Document(Arc<Revision>, Vec<Mask>, &'static str, Change),
   Masks(Vec<Mask>),
 }
 struct ObjectDrag {
@@ -73,6 +79,7 @@ enum ResultItem {
     before: Arc<Revision>,
     after: Arc<Revision>,
     page_change: Option<(usize, Vec<Mask>)>,
+    change: Change,
   },
   Saved {
     path: PathBuf,
@@ -122,7 +129,7 @@ impl Editor {
       MaskUndo::Added(_) => "Добавление скрывающего блока",
       MaskUndo::Removed(..) => "Удаление скрывающего блока",
       MaskUndo::Masks(_) => "Настройка пикселизации",
-      MaskUndo::Document(_, _, label) => *label,
+      MaskUndo::Document(_, _, label, _) => *label,
     };
     let mut text =
       String::from("История текущего сеанса\n\nВыполненные действия (сначала последнее):\n");
@@ -179,13 +186,16 @@ impl Editor {
     }
   }
 
-  fn history_step(&mut self, redo: bool) -> Option<bool> {
+  fn history_step(&mut self, redo: bool) -> Option<Change> {
     let change = if redo {
       self.mask_redo.pop()?
     } else {
       self.mask_undo.pop()?
     };
-    let document = matches!(change, MaskUndo::Document(..));
+    let scope = match &change {
+      MaskUndo::Document(_, _, _, scope) => *scope,
+      _ => Change::Overlays,
+    };
     let inverse = match change {
       MaskUndo::Added(index) => MaskUndo::Removed(index, self.masks.remove(index)),
       MaskUndo::Removed(index, mask) => {
@@ -193,12 +203,13 @@ impl Editor {
         MaskUndo::Added(index)
       }
       MaskUndo::Masks(masks) => MaskUndo::Masks(std::mem::replace(&mut self.masks, masks)),
-      MaskUndo::Document(previous, masks, label) => {
+      MaskUndo::Document(previous, masks, label, scope) => {
         let session = self.session.as_mut()?;
         MaskUndo::Document(
           std::mem::replace(&mut session.current, previous),
           std::mem::replace(&mut self.masks, masks),
           label,
+          scope,
         )
       }
     };
@@ -213,7 +224,7 @@ impl Editor {
     self.drag = None;
     self.start = None;
     self.object_drag = None;
-    Some(document)
+    Some(scope)
   }
 
   #[cfg(test)]
@@ -265,7 +276,7 @@ impl Editor {
 
   fn trim_history(&mut self) {
     let size = |item: &MaskUndo| match item {
-      MaskUndo::Document(r, _, _) => r.size,
+      MaskUndo::Document(r, _, _, _) => r.size,
       _ => 0,
     };
     let mut bytes = self
@@ -397,7 +408,12 @@ pub(super) unsafe fn menu(hwnd: HWND) {
 }
 
 impl App {
-  pub(super) unsafe fn commit_revision(&mut self, before: Arc<Revision>, after: Arc<Revision>) {
+  pub(super) unsafe fn commit_revision(
+    &mut self,
+    before: Arc<Revision>,
+    after: Arc<Revision>,
+    page: usize,
+  ) {
     if before.hash == after.hash {
       return;
     }
@@ -410,12 +426,13 @@ impl App {
       before,
       self.editor.masks.clone(),
       "Изменение текста",
+      Change::Page(page),
     ));
     self.editor.session = Some(Session {
       current: after,
       saved_hash,
     });
-    self.reload_revision();
+    self.reload_revision(Change::Page(page));
     self.status = "Текст изменён · Ctrl+Z — отменить · Ctrl+S — сохранить".into();
   }
   pub(super) unsafe fn apply_operation(
@@ -448,6 +465,16 @@ impl App {
     let inserted = match &operation {
       Operation::InsertPages { at, .. } => Some(*at),
       _ => None,
+    };
+    let change = match &operation {
+      Operation::Text { page, .. }
+      | Operation::FontText { page, .. }
+      | Operation::Delete { page, .. }
+      | Operation::Transform { page, .. }
+      | Operation::NoteText { page, .. }
+      | Operation::NoteDelete { page, .. } => Change::Page(*page),
+      Operation::Annotate { note } => Change::Page(note.page),
+      _ => Change::Document,
     };
     self.job(move |cancel, _| {
       let before = if let Some(previous) = previous {
@@ -495,6 +522,7 @@ impl App {
         before,
         after,
         page_change,
+        change,
       })
     });
   }
@@ -582,10 +610,59 @@ impl App {
     }
   }
 
-  unsafe fn reload_revision(&mut self) {
+  unsafe fn reload_revision(&mut self, change: Change) {
     let Some(path) = self.document_path() else {
       return;
     };
+    if let Change::Page(page) = change {
+      self.editor.selected = None;
+      self.editor.fingerprint = self.editor.revision().map(|r| r.hash);
+      self.editor.mosaic_plan.clear();
+      if let Some(grids) = &mut self.editor.grids {
+        grids.invalidate_page(page);
+        grids.finish_page(page);
+      }
+      self.reader.invalidate_page(page);
+      if self.reader.search_open {
+        SetWindowTextW(
+          self.control(reading::FIND_STATUS),
+          wide("Enter — найти").as_ptr(),
+        );
+      }
+      let review_mode = self.review.mode;
+      self.review.stop();
+      self.review.mode = review_mode;
+      self.position_review_actions();
+      self.frames.invalidate_page(page);
+      self.details.invalidate_page(page);
+      self.thumbnails.invalidate_page(page);
+      self.generation += 1;
+      self.refreshing_revision = true;
+      self.last_error = false;
+      if let Some(key) = &mut self.layout_key {
+        key.0 = self.generation;
+      }
+      if let Some(context) = &mut self.thumb_context {
+        context.0 = self.generation;
+      }
+      self.render_plan.clear();
+      self.thumb_plan.clear();
+      if self
+        .worker
+        .sender
+        .send(Command::Open {
+          path,
+          generation: self.generation,
+        })
+        .is_err()
+      {
+        self.error("Рабочий поток PDF остановлен.".into());
+      } else {
+        self.request();
+      }
+      self.update_title();
+      return;
+    }
     let logical = self.path.clone();
     let review_mode = self.review.mode;
     let mut editor = std::mem::take(&mut self.editor);
@@ -868,15 +945,19 @@ impl App {
               before,
               after,
               page_change,
+              change,
             }) => {
               let saved_hash = self
                 .editor
                 .session
                 .as_ref()
                 .map_or(before.hash, |s| s.saved_hash);
-              self
-                .editor
-                .record(MaskUndo::Document(before, self.editor.masks.clone(), label));
+              self.editor.record(MaskUndo::Document(
+                before,
+                self.editor.masks.clone(),
+                label,
+                change,
+              ));
               if let Some((page, masks)) = &page_change {
                 self.page = *page;
                 self.editor.masks = masks.clone();
@@ -885,7 +966,7 @@ impl App {
                 current: after,
                 saved_hash,
               });
-              self.reload_revision();
+              self.reload_revision(change);
               if let Some((page, _)) = page_change {
                 self.anchor = Some(ViewAnchor {
                   page,
@@ -1524,9 +1605,9 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
     UNDO | REDO => {
       with_app(|a| {
         ReleaseCapture();
-        if let Some(document) = a.editor.history_step(id == REDO) {
-          if document {
-            a.reload_revision();
+        if let Some(change) = a.editor.history_step(id == REDO) {
+          if change != Change::Overlays {
+            a.reload_revision(change);
           }
           a.status = if id == REDO {
             "Действие повторено · Ctrl+Z — отменить"
@@ -1613,6 +1694,7 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
             before,
             after,
             page_change: None,
+            change: Change::Page(page),
           })
         })
       });
@@ -1977,9 +2059,12 @@ mod tests {
     editor.add_mask(mask(0.1));
     editor.selected_mask = Some(0);
     editor.remove_mask();
-    editor
-      .mask_undo
-      .push(MaskUndo::Document(revision, vec![], "Изменение PDF"));
+    editor.mask_undo.push(MaskUndo::Document(
+      revision,
+      vec![],
+      "Изменение PDF",
+      Change::Document,
+    ));
     assert!(!editor.undo_mask());
     assert!(matches!(
       editor.mask_undo.pop(),
@@ -1997,9 +2082,9 @@ mod tests {
     editor.add_mask(mask(0.3));
     editor.selected_mask = Some(0);
     editor.remove_mask();
-    assert_eq!(editor.history_step(false), Some(false));
+    assert_eq!(editor.history_step(false), Some(Change::Overlays));
     assert_eq!(editor.masks[0].bounds[0], 0.1);
-    assert_eq!(editor.history_step(true), Some(false));
+    assert_eq!(editor.history_step(true), Some(Change::Overlays));
     assert_eq!(editor.masks.len(), 1);
     assert_eq!(editor.masks[0].bounds[0], 0.3);
     editor.history_step(false);
@@ -2019,12 +2104,17 @@ mod tests {
       }),
       ..Editor::default()
     };
-    editor.record(MaskUndo::Document(before.clone(), vec![], "Изменение PDF"));
+    editor.record(MaskUndo::Document(
+      before.clone(),
+      vec![],
+      "Изменение PDF",
+      Change::Document,
+    ));
     assert!(!editor.dirty());
-    assert_eq!(editor.history_step(false), Some(true));
+    assert_eq!(editor.history_step(false), Some(Change::Document));
     assert!(editor.dirty());
     assert_eq!(editor.session.as_ref().unwrap().current.hash, before.hash);
-    assert_eq!(editor.history_step(true), Some(true));
+    assert_eq!(editor.history_step(true), Some(Change::Document));
     assert!(!editor.dirty());
     assert_eq!(editor.session.as_ref().unwrap().current.hash, after.hash);
   }
@@ -2049,13 +2139,36 @@ mod tests {
     }
     assert_eq!(editor.mask_undo.len(), 100);
     for _ in 0..100 {
-      assert_eq!(editor.history_step(false), Some(false));
+      assert_eq!(editor.history_step(false), Some(Change::Overlays));
     }
     assert_eq!(editor.masks.len(), 50);
     for _ in 0..100 {
-      assert_eq!(editor.history_step(true), Some(false));
+      assert_eq!(editor.history_step(true), Some(Change::Overlays));
     }
     assert_eq!(editor.masks.len(), 150);
+  }
+
+  #[test]
+  fn undo_and_redo_keep_the_affected_page() {
+    let before = Revision::new(b"before").unwrap();
+    let after = Revision::new(b"after").unwrap();
+    let mut editor = Editor {
+      session: Some(Session {
+        current: after.clone(),
+        saved_hash: before.hash,
+      }),
+      ..Editor::default()
+    };
+    editor.record(MaskUndo::Document(
+      before.clone(),
+      vec![],
+      "Замечание",
+      Change::Page(7),
+    ));
+    assert_eq!(editor.history_step(false), Some(Change::Page(7)));
+    assert_eq!(editor.session.as_ref().unwrap().current.hash, before.hash);
+    assert_eq!(editor.history_step(true), Some(Change::Page(7)));
+    assert_eq!(editor.session.as_ref().unwrap().current.hash, after.hash);
   }
 
   #[test]
@@ -2070,8 +2183,13 @@ mod tests {
       }),
       ..Editor::default()
     };
-    editor.record(MaskUndo::Document(before.clone(), vec![], "Изменение PDF"));
-    assert_eq!(editor.history_step(false), Some(true));
+    editor.record(MaskUndo::Document(
+      before.clone(),
+      vec![],
+      "Изменение PDF",
+      Change::Document,
+    ));
+    assert_eq!(editor.history_step(false), Some(Change::Document));
     assert_eq!(editor.session.as_ref().unwrap().current.hash, before.hash);
     assert!(!editor.can_redo());
   }

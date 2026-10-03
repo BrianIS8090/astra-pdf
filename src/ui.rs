@@ -7,7 +7,7 @@ use crate::{
   worker::{Command, Event, Worker, READY},
 };
 use std::{
-  cell::RefCell,
+  cell::{Cell, RefCell},
   path::PathBuf,
   ptr,
   sync::{
@@ -90,6 +90,9 @@ struct App {
   scale: f64,
   rotation: i32,
   generation: u64,
+  refreshing_revision: bool,
+  page_render_counts: Vec<u64>,
+  placeholder_paints: Cell<u64>,
   ticket: u64,
   image: Option<Raster>,
   wanted: (i32, i32),
@@ -530,6 +533,8 @@ impl App {
     self.first_frame_ms = None;
     self.last_error = false;
     self.generation += 1;
+    self.refreshing_revision = false;
+    self.page_render_counts.clear();
     self.ticket += 1;
     self.worker.latest.store(self.ticket, Ordering::Relaxed);
     self.path = Some(path.clone());
@@ -756,17 +761,6 @@ impl App {
       return;
     }
     self.reflow();
-    let current_key = self.page_key(self.page);
-    self.image = self
-      .frames
-      .peek(&current_key)
-      .or_else(|| {
-        self
-          .detail_mode
-          .then(|| self.frames.preview(&current_key))
-          .flatten()
-      })
-      .cloned();
     let mut pages = self.visible_pages();
     pages.sort_by_key(|p| p.abs_diff(self.page));
     let mut plan = vec![];
@@ -808,12 +802,51 @@ impl App {
         self.error("Рабочий поток PDF остановлен.".into());
       }
     }
+    self.finish_page_refreshes();
+    self.image = self.display_frame(self.page).cloned();
     self.sync_page_controls();
     self.refresh_status();
     self.request_thumbnails();
     self.request_mosaics();
     self.position_editor_actions();
     InvalidateRect(self.canvas, ptr::null(), 0);
+  }
+
+  fn page_refresh_pending(&self, page: usize) -> bool {
+    self
+      .render_plan
+      .iter()
+      .any(|key| key.page == page && self.cached(key).is_none())
+  }
+
+  unsafe fn display_frame(&self, page: usize) -> Option<&Raster> {
+    let key = self.page_key(page);
+    let previous = self
+      .frames
+      .previous(&key)
+      .or_else(|| self.frames.previous_preview(&key));
+    if self.page_refresh_pending(page) && previous.is_some() {
+      return previous;
+    }
+    let thumb = self.thumbnail_key(page);
+    self
+      .frames
+      .peek(&key)
+      .or_else(|| self.frames.preview(&key))
+      .or(previous)
+      .or_else(|| self.thumbnails.peek(&thumb))
+      .or_else(|| self.thumbnails.previous(&thumb))
+  }
+
+  fn finish_page_refreshes(&mut self) {
+    // Все видимые участки одной страницы заменяются вместе, без промежуточной мозаики.
+    let pages: Vec<_> = self.render_plan.iter().map(|key| key.page).collect();
+    for page in pages {
+      if !self.page_refresh_pending(page) {
+        self.frames.finish_page(page);
+        self.details.finish_page(page);
+      }
+    }
   }
 
   unsafe fn refresh_status(&mut self) {
@@ -934,8 +967,9 @@ impl App {
 
   unsafe fn navigate(&mut self, index: usize) {
     if index < self.sizes.len() {
-      self.page = index;
       self.reflow();
+      // Явный переход важнее якоря, оставшегося после изменения размера окна.
+      self.page = index;
       self.scroll = (
         0,
         if self.continuous {
@@ -1175,7 +1209,21 @@ impl App {
           millis,
         } if generation == self.generation => {
           self.editor.fingerprint = Some(fingerprint);
+          if self.refreshing_revision && self.sizes == sizes {
+            // Локальная правка сохраняет список страниц, прокрутку и готовые кадры.
+            continue;
+          }
+          if self.refreshing_revision {
+            self.refreshing_revision = false;
+            self.frames = Cache::with_count(96 * 1024 * 1024, 64);
+            self.details = Cache::with_count(64 * 1024 * 1024, 64);
+            self.thumbnails = Cache::with_count(16 * 1024 * 1024, 48);
+            self.layout_key = None;
+            self.render_plan.clear();
+            self.thumb_plan.clear();
+          }
           self.sizes = sizes;
+          self.page_render_counts.resize(self.sizes.len(), 0);
           self.page = self.page.min(self.sizes.len().saturating_sub(1));
           if self.editor.revision().is_none() {
             self.resume_reading(fingerprint);
@@ -1183,6 +1231,7 @@ impl App {
           self.status = format!("Открыто за {millis} мс · анализ слоёв…");
           let list = self.control(PAGE_LIST);
           SendMessageW(list, WM_SETREDRAW, 0, 0);
+          SendMessageW(list, LB_RESETCONTENT, 0, 0);
           for i in 0..self.sizes.len() {
             SendMessageW(
               list,
@@ -1200,6 +1249,22 @@ impl App {
           groups,
           warning,
         } if generation == self.generation => {
+          if self.refreshing_revision {
+            self.refreshing_revision = false;
+            if self.layers == items
+              && self.groups == groups
+              && self.layer_warning == warning.is_some()
+            {
+              continue;
+            }
+            // Неожиданное изменение общих ресурсов исключает повторное использование кадров.
+            self.frames = Cache::with_count(96 * 1024 * 1024, 64);
+            self.details = Cache::with_count(64 * 1024 * 1024, 64);
+            self.thumbnails = Cache::with_count(16 * 1024 * 1024, 48);
+            self.render_plan.clear();
+            self.thumb_plan.clear();
+            self.editor.reload_states = Some(self.states.clone());
+          }
           self.states = self
             .editor
             .reload_states
@@ -1227,6 +1292,9 @@ impl App {
           key,
           image,
         } if generation == self.generation && ticket == self.ticket => {
+          if let Some(count) = self.page_render_counts.get_mut(key.page) {
+            *count += 1;
+          }
           self
             .first_frame_ms
             .get_or_insert(self.opened_at.elapsed().as_millis());
@@ -1235,17 +1303,8 @@ impl App {
           } else {
             self.frames.put(key, image);
           }
-          let current_key = self.page_key(self.page);
-          self.image = self
-            .frames
-            .peek(&current_key)
-            .or_else(|| {
-              self
-                .detail_mode
-                .then(|| self.frames.preview(&current_key))
-                .flatten()
-            })
-            .cloned();
+          self.finish_page_refreshes();
+          self.image = self.display_frame(self.page).cloned();
           self.rendering = self
             .render_plan
             .iter()
@@ -1263,6 +1322,7 @@ impl App {
           image,
         } if generation == self.generation && ticket == self.thumb_ticket => {
           if let Some(image) = image {
+            self.thumbnails.finish_page(key.page);
             self.thumbnails.put(key, image);
           }
           InvalidateRect(self.control(PAGE_LIST), ptr::null(), 0);
@@ -1401,15 +1461,15 @@ impl App {
           },
           0x00d3ceca,
         );
-        let key = self.page_key(page);
-        let preview = self
-          .frames
-          .peek(&key)
-          .or_else(|| self.frames.preview(&key))
-          .or_else(|| self.thumbnails.peek(&self.thumbnail_key(page)));
+        let preview = self.display_frame(page);
         if let Some(image) = preview {
           printing::draw_raster(mem, image, x, y, p.width, p.height);
         } else {
+          if self.probe.is_some() {
+            self
+              .placeholder_paints
+              .set(self.placeholder_paints.get() + 1);
+          }
           fill(
             mem,
             &RECT {
@@ -1435,7 +1495,11 @@ impl App {
           );
         }
         for key in self.detail_keys(page) {
-          if let Some(image) = self.details.peek(&key) {
+          let previous = self
+            .page_refresh_pending(page)
+            .then(|| self.details.previous(&key))
+            .flatten();
+          if let Some(image) = previous.or_else(|| self.details.peek(&key)) {
             let region = key.region.unwrap();
             printing::draw_raster(
               mem,
@@ -1449,6 +1513,11 @@ impl App {
         }
       }
     } else {
+      if self.probe.is_some() {
+        self
+          .placeholder_paints
+          .set(self.placeholder_paints.get() + 1);
+      }
       let middle = r.bottom / 2;
       text(
         mem,
@@ -1524,7 +1593,11 @@ impl App {
       },
       if selected { 0x0095711c } else { 0x00d8d3cc },
     );
-    if let Some(image) = self.thumbnails.peek(&key) {
+    if let Some(image) = self
+      .thumbnails
+      .peek(&key)
+      .or_else(|| self.thumbnails.previous(&key))
+    {
       printing::draw_raster(item.hDC, image, x, y, key.width, key.height);
     } else {
       fill(
@@ -1924,6 +1997,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
           &report[..report.len()-1], a.detail_mode, tiles.len(), tiles.iter().filter(|k| a.details.peek(k).is_some()).count(), a.details.bytes, [a.viewport().0,a.viewport().1]);
         let mut report: serde_json::Value = serde_json::from_str(&report).unwrap();
         report["editor"] = a.editor.probe();
+        report["page_render_counts"] = serde_json::json!(a.page_render_counts);
+        report["placeholder_paints"] = serde_json::json!(a.placeholder_paints.get());
+        report["refreshing_revision"] = serde_json::json!(a.refreshing_revision);
+        report["display_ready_pages"] = serde_json::json!(a
+          .visible_pages()
+          .into_iter()
+          .filter(|&p| a.display_frame(p).is_some())
+          .collect::<Vec<_>>());
         report["status"] = serde_json::json!(a.status);
         report["reader"] = a.reader.probe();
         report["draft"] = a
@@ -2549,6 +2630,9 @@ pub fn run(
       scale: 1.,
       rotation: 0,
       generation: 0,
+      refreshing_revision: false,
+      page_render_counts: vec![],
+      placeholder_paints: Cell::new(0),
       ticket: 0,
       image: None,
       wanted: (0, 0),

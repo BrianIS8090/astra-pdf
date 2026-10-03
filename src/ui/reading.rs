@@ -52,6 +52,20 @@ impl Drop for Reader {
 }
 
 impl Reader {
+  pub(super) fn invalidate_page(&mut self, page: usize) {
+    self.cancel.store(true, Ordering::Relaxed);
+    self.receiver = None;
+    self.requested = None;
+    self.search_pending = false;
+    self.pages.retain(|(p, _)| *p != page);
+    self.failed_pages.retain(|p| *p != page);
+    self.selection = None;
+    self.dragging = false;
+    // После изменения текста прежние координаты поиска уже недействительны.
+    self.results.clear();
+    self.current = None;
+    self.query.clear();
+  }
   pub fn note_at(
     &self,
     page: usize,

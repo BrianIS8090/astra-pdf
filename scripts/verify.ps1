@@ -61,6 +61,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка сохранения шрифтов и оформления' }
   & $Python "$PSScriptRoot\verify_inline_ui.py" $exe "$outputDir\fonts-ui\fonts.pdf" "$outputDir\inline-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка текста на странице и изменения размеров' }
+  & $Python "$PSScriptRoot\verify_edit_refresh.py" $exe "$outputDir\fonts-ui\fonts.pdf" "$outputDir\edit-refresh-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка обновления страницы без мерцания' }
   & $Python "$PSScriptRoot\verify_pages_ui.py" $exe $demo "$outputDir\pages-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка управления страницами' }
   & $Python "$PSScriptRoot\verify_review_ui.py" $exe $demo "$outputDir\review-ui"

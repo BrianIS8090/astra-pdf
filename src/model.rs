@@ -124,6 +124,7 @@ pub fn visible_tiles(page: (i32, i32), visible: Region) -> Vec<Region> {
 
 pub struct Cache {
   entries: VecDeque<(RenderKey, Raster)>,
+  previous: VecDeque<(RenderKey, Raster)>,
   pub bytes: usize,
   limit: usize,
   count: usize,
@@ -133,6 +134,7 @@ impl Cache {
   pub fn new(limit: usize) -> Self {
     Self {
       entries: VecDeque::new(),
+      previous: VecDeque::new(),
       bytes: 0,
       limit,
       count: 4,
@@ -167,6 +169,48 @@ impl Cache {
   pub fn len(&self) -> usize {
     self.entries.len()
   }
+  // Старый кадр нужен только для показа до готовности новой версии страницы.
+  // В поиск готовых результатов он не попадает и не отменяет новую отрисовку.
+  pub fn invalidate_page(&mut self, page: usize) {
+    let already_pending = self.previous.iter().any(|(k, _)| k.page == page);
+    let mut keep = VecDeque::new();
+    for (key, image) in self.entries.drain(..) {
+      if key.page != page {
+        keep.push_back((key, image));
+      } else if already_pending {
+        self.bytes -= image.pixels.len();
+      } else {
+        self.previous.push_back((key, image));
+      }
+    }
+    self.entries = keep;
+  }
+  pub fn previous(&self, key: &RenderKey) -> Option<&Raster> {
+    self.previous.iter().find(|(k, _)| k == key).map(|(_, i)| i)
+  }
+  pub fn previous_preview(&self, key: &RenderKey) -> Option<&Raster> {
+    self
+      .previous
+      .iter()
+      .find(|(k, _)| {
+        k.region.is_none()
+          && key.region.is_none()
+          && k.page == key.page
+          && k.rotation == key.rotation
+          && k.states == key.states
+      })
+      .map(|(_, i)| i)
+  }
+  pub fn finish_page(&mut self, page: usize) {
+    self.previous.retain(|(key, image)| {
+      if key.page == page {
+        self.bytes -= image.pixels.len();
+        false
+      } else {
+        true
+      }
+    });
+  }
   pub fn get(&mut self, key: &RenderKey) -> Option<Raster> {
     let i = self.entries.iter().position(|(k, _)| k == key)?;
     let item = self.entries.remove(i)?;
@@ -182,8 +226,8 @@ impl Cache {
     if let Some(i) = self.entries.iter().position(|(k, _)| k == &key) {
       self.bytes -= self.entries.remove(i).unwrap().1.pixels.len();
     }
-    while self.bytes + size > self.limit || self.entries.len() >= self.count {
-      if let Some((_, old)) = self.entries.pop_back() {
+    while self.bytes + size > self.limit || self.entries.len() + self.previous.len() >= self.count {
+      if let Some((_, old)) = self.entries.pop_back().or_else(|| self.previous.pop_back()) {
         self.bytes -= old.pixels.len();
       } else {
         break;
@@ -351,6 +395,75 @@ mod tests {
     enlarged.rotation = 0;
     enlarged.page = 3;
     assert!(cache.preview(&enlarged).is_none());
+  }
+
+  #[test]
+  fn page_refresh_keeps_old_pixels_out_of_render_cache_and_preserves_neighbors() {
+    let mut cache = Cache::with_count(128, 8);
+    let key = |page, width| RenderKey {
+      page,
+      width,
+      height: 2,
+      rotation: 0,
+      states: vec![true],
+      region: None,
+    };
+    let image = |value| Raster {
+      width: 2,
+      height: 2,
+      pixels: Arc::new(vec![value; 16]),
+    };
+    cache.put(key(0, 2), image(1));
+    cache.put(key(0, 3), image(2));
+    cache.put(key(1, 2), image(3));
+    cache.invalidate_page(0);
+    assert!(cache.peek(&key(0, 2)).is_none());
+    assert!(cache.preview(&key(0, 2)).is_none());
+    assert_eq!(cache.previous(&key(0, 2)).unwrap().pixels[0], 1);
+    assert_eq!(cache.peek(&key(1, 2)).unwrap().pixels[0], 3);
+    cache.put(key(0, 2), image(4));
+    assert_eq!(cache.previous(&key(0, 2)).unwrap().pixels[0], 1);
+    assert_eq!(cache.peek(&key(0, 2)).unwrap().pixels[0], 4);
+    cache.finish_page(0);
+    assert!(cache.previous(&key(0, 3)).is_none());
+    assert!(cache.peek(&key(0, 3)).is_none());
+    assert_eq!(cache.preview(&key(0, 3)).unwrap().pixels[0], 4);
+    assert_eq!(cache.bytes, 32);
+  }
+
+  #[test]
+  fn repeated_edits_keep_display_until_latest_revision_is_ready() {
+    let mut cache = Cache::with_count(64, 4);
+    let key = RenderKey {
+      page: 0,
+      width: 2,
+      height: 2,
+      rotation: 0,
+      states: vec![true],
+      region: None,
+    };
+    let image = |value| Raster {
+      width: 2,
+      height: 2,
+      pixels: Arc::new(vec![value; 16]),
+    };
+    cache.put(key.clone(), image(1));
+    for value in 2..100 {
+      cache.invalidate_page(0);
+      assert!(cache.peek(&key).is_none());
+      assert_eq!(cache.previous(&key).unwrap().pixels[0], 1);
+      cache.put(key.clone(), image(value));
+      assert!(cache.bytes <= 64);
+    }
+    let mut changed = key.clone();
+    changed.states[0] = false;
+    assert!(cache.previous_preview(&changed).is_none());
+    changed = key.clone();
+    changed.rotation = 1;
+    assert!(cache.previous_preview(&changed).is_none());
+    cache.finish_page(0);
+    assert_eq!(cache.bytes, 16);
+    assert_eq!(cache.peek(&key).unwrap().pixels[0], 99);
   }
 
   #[test]
