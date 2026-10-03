@@ -67,6 +67,8 @@ def verify(exe, fixture, output):
     checks.append('rotation_keeps_source_grid')
     for command, mm in [(53, 3), (55, 12), (54, 6)]:
       viewer.command(command)
+      # Команда редактора обрабатывается отложенно; старый кадр ещё может быть готов.
+      wait(lambda: viewer.snapshot()['editor']['masks'][0]['kind']['Pixelate']['block_mm'] == mm)
       current = ready()
       assert current['editor']['masks'][0]['kind']['Pixelate']['block_mm'] == mm
       assert current['editor']['bytes'] <= 16 * 1024 * 1024

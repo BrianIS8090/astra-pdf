@@ -352,7 +352,8 @@ def run(exe, corpus, output, demo, extra):
     u.GetWindowRect(viewer.hwnd, c.byref(window_rect))
     with Image.open(viewer.output.with_suffix('.png')) as screenshot:
       color = screenshot.convert('RGB').getpixel((list_rect.left - window_rect.left + 8, list_rect.top - window_rect.top + row.top + 8))
-      assert color == (227, 239, 244), f'Не обновлена подсветка текущей миниатюры: {color}'
+      expected = (40, 63, 89) if viewer.snapshot()['theme'] == 'dark' else (203, 222, 242)
+      assert color == expected, f'Не обновлена подсветка текущей миниатюры: {color}, ожидается {expected}'
     viewer.command(25)
     viewer.page(1)
     u.PostMessageW(viewer.hwnd, 0x100, 0x22, 0)
