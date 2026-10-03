@@ -390,6 +390,7 @@ pub(super) unsafe fn menu(hwnd: HWND) {
         (ABOUT, "О программе"),
       ],
     ),
+    ("Вид", vec![(THEME, "Тёмная тема")]),
   ] {
     let popup = CreatePopupMenu();
     for (id, label) in items {

@@ -19,6 +19,60 @@ struct State {
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+  if msg == DM_GETDEFID {
+    return ((DC_HASDEFID as usize) << 16 | 1) as LRESULT;
+  }
+  if msg == DM_SETDEFID {
+    return 1;
+  }
+  if let Some(result) = crate::theme::control_color(msg, wp, lp) {
+    return result;
+  }
+  if msg == WM_ERASEBKGND {
+    let mut rect: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    crate::theme::fill(wp as HDC, &rect, crate::theme::palette().panel);
+    return 1;
+  }
+  if msg == WM_DRAWITEM {
+    let item = &*(lp as *const DRAWITEMSTRUCT);
+    if item.CtlType == ODT_BUTTON {
+      let palette = crate::theme::palette();
+      crate::theme::fill(item.hDC, &item.rcItem, palette.border);
+      let mut rect = item.rcItem;
+      InflateRect(&mut rect, -1, -1);
+      crate::theme::fill(
+        item.hDC,
+        &rect,
+        if item.itemState & ODS_SELECTED != 0 {
+          palette.selected
+        } else {
+          palette.field
+        },
+      );
+      let mut value = [0u16; 128];
+      GetWindowTextW(item.hwndItem, value.as_mut_ptr(), 128);
+      let old = SelectObject(
+        item.hDC,
+        SendMessageW(item.hwndItem, WM_GETFONT, 0, 0) as HGDIOBJ,
+      );
+      SetTextColor(item.hDC, palette.text);
+      SetBkMode(item.hDC, TRANSPARENT as i32);
+      DrawTextW(
+        item.hDC,
+        value.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+      );
+      if item.itemState & ODS_FOCUS != 0 {
+        InflateRect(&mut rect, -3, -3);
+        DrawFocusRect(item.hDC, &rect);
+      }
+      SelectObject(item.hDC, old);
+      return 1;
+    }
+  }
   if msg == WM_NCCREATE {
     SetWindowLongPtrW(
       hwnd,
@@ -80,6 +134,7 @@ pub unsafe fn prompt(
   if hwnd.is_null() {
     return None;
   }
+  crate::theme::title(hwnd);
   let font = CreateFontW(
     -u(15),
     0,
@@ -101,7 +156,13 @@ pub unsafe fn prompt(
       0,
       wide(class).as_ptr(),
       wide(text).as_ptr(),
-      WS_CHILD | WS_VISIBLE | style,
+      WS_CHILD
+        | WS_VISIBLE
+        | if class == "BUTTON" {
+          (style & !0xf) | BS_OWNERDRAW as u32
+        } else {
+          style
+        },
       u(x),
       u(y),
       u(w),
@@ -112,6 +173,7 @@ pub unsafe fn prompt(
       ptr::null(),
     );
     SendMessageW(control, WM_SETFONT, font as usize, 1);
+    crate::theme::control(control);
     control
   };
   child("STATIC", label, 0, 100, 16, 12, 570, 84);

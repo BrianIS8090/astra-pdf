@@ -46,6 +46,8 @@ try {
   $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
   $demo = Join-Path $outputDir 'Слои и страницы.pdf'
   Invoke-Viewer @('--demo', (Quoted $demo))
+  & $Python "$PSScriptRoot\verify_theme.py" $exe $demo "$outputDir\theme-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка тем, сохранения выбора и неизменности PDF' }
   $sourceHash = (Get-FileHash -LiteralPath $demo).Hash
   Copy-Item -LiteralPath $demo -Destination "$portable\Демонстрация-слоёв.pdf"
   Invoke-Viewer @('--engine-selftest', (Quoted $demo), (Quoted "$outputDir\engine.json"))

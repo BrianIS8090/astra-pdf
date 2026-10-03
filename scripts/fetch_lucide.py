@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1] / 'assets' / 'lucide'
 NAMES = ['folder-open', 'save', 'printer', 'chevron-left', 'chevron-right',
   'minus', 'plus', 'scan', 'move-horizontal', 'rotate-cw', 'scroll',
   'mouse-pointer-2', 'grid-3x3', 'shield', 'scan-line', 'undo-2', 'x',
-  'text-cursor-input', 'trash', 'files', 'layers', 'rotate-ccw']
+  'text-cursor-input', 'trash', 'files', 'layers', 'rotate-ccw', 'moon', 'sun']
 
 if __name__ == '__main__':
   ROOT.mkdir(parents=True, exist_ok=True)

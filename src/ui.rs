@@ -4,6 +4,7 @@ use crate::{
   model::{render_size, visible_tiles, Cache, Region, RenderKey, Zoom},
   pdf::Raster,
   printing::{self, wide},
+  theme,
   worker::{Command, Event, Worker, READY},
 };
 use std::{
@@ -51,6 +52,7 @@ const TAB_LAYERS: usize = 25;
 const LAYER_NOTE: usize = 26;
 const CONTINUOUS: usize = 27;
 const VIEW_MODE: usize = 28;
+const THEME: usize = 29;
 
 type LayoutKey = (u64, i32, i32, Zoom, u32, i32, bool);
 type ThumbContext = (u64, u32, i32, Vec<bool>);
@@ -75,6 +77,7 @@ struct App {
   canvas: HWND,
   controls: Vec<(usize, HWND)>,
   tool_labels: Vec<Vec<u16>>,
+  tooltip: HWND,
   font: HFONT,
   big_font: HFONT,
   dpi: u32,
@@ -152,6 +155,53 @@ unsafe fn fill(dc: HDC, r: &RECT, color: u32) {
 }
 
 impl App {
+  unsafe fn apply_theme(&self) {
+    theme::title(self.hwnd);
+    theme::control(self.canvas);
+    for (_, control) in &self.controls {
+      theme::control(*control);
+    }
+    let dark = theme::current() == theme::Theme::Dark;
+    SetWindowTextW(
+      self.control(THEME),
+      wide(if dark {
+        "Светлая тема"
+      } else {
+        "Тёмная тема"
+      })
+      .as_ptr(),
+    );
+    CheckMenuItem(
+      GetMenu(self.hwnd),
+      THEME as u32,
+      MF_BYCOMMAND | if dark { MF_CHECKED } else { MF_UNCHECKED },
+    );
+    theme::menu(GetMenu(self.hwnd), true);
+    DrawMenuBar(self.hwnd);
+    if !self.tooltip.is_null() {
+      SetWindowTheme(self.tooltip, wide("").as_ptr(), ptr::null());
+      SendMessageW(
+        self.tooltip,
+        TTM_SETTIPBKCOLOR,
+        theme::palette().field as usize,
+        0,
+      );
+      SendMessageW(
+        self.tooltip,
+        TTM_SETTIPTEXTCOLOR,
+        theme::palette().text as usize,
+        0,
+      );
+    }
+    // Перерисовываем оформление без сброса кадров PDF и истории редактирования.
+    RedrawWindow(
+      self.hwnd,
+      ptr::null(),
+      ptr::null_mut(),
+      RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME,
+    );
+  }
+
   fn unit(&self, n: i32) -> i32 {
     (n as f64 * self.dpi as f64 / 96.).round() as i32
   }
@@ -186,6 +236,7 @@ impl App {
       ptr::null(),
     );
     SendMessageW(hwnd, WM_SETFONT, self.font as usize, 1);
+    theme::control(hwnd);
     self.controls.push((id, hwnd));
     hwnd
   }
@@ -205,6 +256,7 @@ impl App {
       (RESET, "Сбросить слои"),
       (TAB_PAGES, "Страницы"),
       (TAB_LAYERS, "Слои"),
+      (THEME, "Тёмная тема"),
     ] {
       self.create(id, "BUTTON", label, BS_OWNERDRAW as u32);
     }
@@ -357,6 +409,10 @@ impl App {
     ] {
       self.place(id, x, 10, w, 32);
     }
+    self.place(THEME, width - 44, 10, 32, 32);
+    if width < 556 {
+      self.place(CONTINUOUS, 408, 52, 32, 32);
+    }
     let tools_x = if wrapped { 12 } else { 536 };
     let tools_y = if wrapped { 52 } else { 10 };
     for (i, id) in [
@@ -472,6 +528,10 @@ impl App {
   unsafe fn enable_controls(&self) {
     let loaded = !self.sizes.is_empty();
     for (id, h) in &self.controls {
+      if *id == THEME {
+        EnableWindow(*h, 1);
+        continue;
+      }
       let enabled = match *id {
         OPEN => !self.printing,
         TAB_PAGES | TAB_LAYERS | LAYER_NOTE => true,
@@ -1035,6 +1095,14 @@ impl App {
   }
 
   unsafe fn action(&mut self, id: usize) {
+    if id == THEME {
+      theme::set(theme::current().toggled());
+      self.apply_theme();
+      if let Err(error) = theme::save(theme::current()) {
+        self.status = format!("Тема изменена, но сохранить выбор не удалось: {error}");
+      }
+      return;
+    }
     if id == updates::CHECK {
       self.check_updates();
       return;
@@ -1362,11 +1430,12 @@ impl App {
   }
 
   unsafe fn paint(&self, target: Option<HDC>) {
+    let palette = theme::palette();
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = target.unwrap_or_else(|| BeginPaint(self.hwnd, &mut ps));
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(self.hwnd, &mut r);
-    fill(dc, &r, 0x00faf9f8);
+    fill(dc, &r, palette.panel);
     for x in [128, 272, 352, 520] {
       fill(
         dc,
@@ -1376,7 +1445,7 @@ impl App {
           top: self.unit(17),
           bottom: self.unit(35),
         },
-        0x00e4dfda,
+        palette.border,
       );
     }
     if self.toolbar_height == 52 && r.right >= self.unit(1140) && !self.sizes.is_empty() {
@@ -1384,7 +1453,7 @@ impl App {
         dc,
         RECT {
           left: self.unit(772),
-          right: r.right - self.unit(16),
+          right: r.right - self.unit(56),
           top: self.unit(10),
           bottom: self.unit(42),
         },
@@ -1394,7 +1463,7 @@ impl App {
           self.sizes.len(),
           self.scale * 100.
         ),
-        0x00857769,
+        palette.muted,
         self.font,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
       );
@@ -1407,7 +1476,7 @@ impl App {
         right: r.right,
         bottom: self.unit(self.toolbar_height),
       },
-      0x00dedede,
+      palette.border,
     );
     fill(
       dc,
@@ -1417,7 +1486,7 @@ impl App {
         right: self.unit(240),
         bottom: r.bottom - self.unit(32),
       },
-      0x00dedede,
+      palette.border,
     );
     text(
       dc,
@@ -1428,7 +1497,7 @@ impl App {
         bottom: r.bottom,
       },
       &self.status,
-      0x00585858,
+      palette.muted,
       self.font,
       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
@@ -1438,6 +1507,7 @@ impl App {
   }
 
   unsafe fn paint_canvas(&self, target: Option<HDC>) {
+    let palette = theme::palette();
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = target.unwrap_or_else(|| BeginPaint(self.canvas, &mut ps));
     let mut r: RECT = std::mem::zeroed();
@@ -1445,7 +1515,7 @@ impl App {
     let mem = CreateCompatibleDC(dc);
     let bitmap = CreateCompatibleBitmap(dc, r.right.max(1), r.bottom.max(1));
     let old = SelectObject(mem, bitmap);
-    fill(mem, &r, 0x00ece9e6);
+    fill(mem, &r, palette.canvas);
     if !self.document_layout.pages.is_empty() {
       for page in self.visible_pages() {
         let p = &self.document_layout.pages[page];
@@ -1459,7 +1529,7 @@ impl App {
             right: x + p.width + 3,
             bottom: y + p.height + 4,
           },
-          0x00d3ceca,
+          palette.shadow,
         );
         let preview = self.display_frame(page);
         if let Some(image) = preview {
@@ -1532,7 +1602,7 @@ impl App {
         } else {
           "Astra PDF"
         },
-        0x00483a30,
+        palette.text,
         self.big_font,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
       );
@@ -1549,7 +1619,7 @@ impl App {
         } else {
           "Откройте PDF или перетащите его в окно\nCtrl+O — открыть документ"
         },
-        0x00786858,
+        palette.muted,
         self.font,
         DT_CENTER,
       );
@@ -1568,6 +1638,7 @@ impl App {
   }
 
   unsafe fn paint_thumbnail(&self, item: &DRAWITEMSTRUCT) {
+    let palette = theme::palette();
     if item.itemID == u32::MAX || item.itemID as usize >= self.sizes.len() {
       return;
     }
@@ -1577,7 +1648,11 @@ impl App {
     fill(
       item.hDC,
       &rect,
-      if selected { 0x00f4efe3 } else { 0x00fafafa },
+      if selected {
+        palette.selected
+      } else {
+        palette.panel
+      },
     );
     let key = self.thumbnail_key(page);
     let x = rect.left + (rect.right - rect.left - key.width) / 2;
@@ -1591,7 +1666,11 @@ impl App {
         right: x + key.width + border,
         bottom: y + key.height + border,
       },
-      if selected { 0x0095711c } else { 0x00d8d3cc },
+      if selected {
+        palette.accent
+      } else {
+        palette.border
+      },
     );
     if let Some(image) = self
       .thumbnails
@@ -1620,7 +1699,11 @@ impl App {
         bottom: rect.bottom - self.unit(6),
       },
       &format!("{}", page + 1),
-      if selected { 0x00604c12 } else { 0x00606060 },
+      if selected {
+        palette.accent
+      } else {
+        palette.muted
+      },
       self.font,
       DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
@@ -1766,6 +1849,11 @@ impl App {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+  if let Some(result) =
+    theme::control_color(msg, wp, lp).or_else(|| theme::menu_message(hwnd, msg, lp))
+  {
+    return result;
+  }
   if msg == WM_APP + 31 {
     updates::show(hwnd);
     return 0;
@@ -1997,6 +2085,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
           &report[..report.len()-1], a.detail_mode, tiles.len(), tiles.iter().filter(|k| a.details.peek(k).is_some()).count(), a.details.bytes, [a.viewport().0,a.viewport().1]);
         let mut report: serde_json::Value = serde_json::from_str(&report).unwrap();
         report["editor"] = a.editor.probe();
+        report["theme"] = serde_json::json!(theme::current().name());
         report["page_render_counts"] = serde_json::json!(a.page_render_counts);
         report["placeholder_paints"] = serde_json::json!(a.placeholder_paints.get());
         report["refreshing_revision"] = serde_json::json!(a.refreshing_revision);
@@ -2116,6 +2205,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     msg if msg == app.page_drag_message => Some(app.page_drag(&*(lp as *const DRAGLISTINFO))),
     WM_INITMENUPOPUP => {
       app.recent_menu();
+      theme::menu(GetMenu(hwnd), true);
       Some(0)
     }
     WM_DRAWITEM => {
@@ -2144,13 +2234,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
       Some(0)
     }
     WM_ERASEBKGND => Some(1),
-    WM_CTLCOLORSTATIC => {
-      let dc = wp as HDC;
-      SetBkMode(dc, TRANSPARENT as i32);
-      SetTextColor(dc, 0x005a4b3b);
-      SetDCBrushColor(dc, 0x00faf9f8);
-      Some(GetStockObject(DC_BRUSH) as isize)
-    }
     WM_PRINTCLIENT => {
       app.paint(Some(wp as HDC));
       Some(0)
@@ -2267,6 +2350,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 }
 
 unsafe extern "system" fn canvas_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+  if let Some(result) = theme::control_color(msg, wp, lp) {
+    return result;
+  }
   let result = with_app(|app| match msg {
     WM_COMMAND if wp & 65535 == inline::INPUT && (wp >> 16) as u32 == EN_CHANGE => {
       app.inline_change();
@@ -2558,6 +2644,7 @@ pub fn run(
 ) -> Result<(), String> {
   unsafe {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    theme::set(theme::load());
     let controls = INITCOMMONCONTROLSEX {
       dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
       dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
@@ -2612,6 +2699,7 @@ pub fn run(
       drag_page: None,
       page_drag_message: RegisterWindowMessageW(DRAGLISTMSGSTRING),
       tool_labels: Vec::new(),
+      tooltip: ptr::null_mut(),
       hwnd,
       canvas: ptr::null_mut(),
       controls: vec![],
@@ -2668,6 +2756,7 @@ pub fn run(
     };
     app.setup();
     editor::menu(hwnd);
+    app.apply_theme();
     let mut monitor: MONITORINFO = std::mem::zeroed();
     monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     GetMonitorInfoW(

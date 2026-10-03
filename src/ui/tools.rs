@@ -19,7 +19,8 @@ pub(super) const ACTIONS: [(usize, &str); 3] = [
   (MASK_DELETE, "Убрать блок"),
 ];
 
-pub(super) const NAV: [(usize, &str); 20] = [
+pub(super) const NAV: [(usize, &str); 21] = [
+  (THEME, "Светлая / тёмная тема · выбор сохраняется"),
   (reading::FIND, "Поиск · Ctrl+F"),
   (reading::TEXT, "Выделить текст · Ctrl+C — копировать"),
   (reading::BOOKMARKS, "Закладки PDF"),
@@ -84,6 +85,8 @@ unsafe extern "system" fn button_proc(
 
 fn icon(id: usize) -> &'static [u8] {
   match id {
+    THEME => include_bytes!("../../assets/lucide/moon.png"),
+    1001 => include_bytes!("../../assets/lucide/sun.png"),
     141 => include_bytes!("../../assets/lucide/save.png"),
     142 => include_bytes!("../../assets/lucide/x.png"),
     143 => include_bytes!("../../assets/lucide/scan.png"),
@@ -161,6 +164,7 @@ impl App {
       GetModuleHandleW(ptr::null()),
       ptr::null(),
     );
+    self.tooltip = tips;
     for (id, label) in NAV
       .into_iter()
       .chain(pages::BUTTONS)
@@ -196,6 +200,7 @@ impl App {
   }
 
   pub(super) unsafe fn paint_editor_button(&self, item: &DRAWITEMSTRUCT) {
+    let palette = theme::palette();
     let id = item.CtlID as usize;
     let active = self.editor.active(id)
       || self.review.active(id)
@@ -209,24 +214,24 @@ impl App {
     let pressed = item.itemState & ODS_SELECTED != 0;
     let hover = !GetPropW(item.hwndItem, wide("AstraHover").as_ptr()).is_null();
     let background = if active {
-      0x00f2decb
+      palette.selected
     } else if !disabled && pressed {
-      0x00e5d9ca
+      palette.pressed
     } else if !disabled && hover {
-      0x00eeebe7
+      palette.hover
     } else {
-      0x00faf9f8
+      palette.panel
     };
     let foreground = if disabled {
-      0x00b5aea7
+      palette.disabled
     } else if active {
-      0x00a36519
+      palette.accent
     } else {
-      0x005a4b3b
+      palette.text
     };
     let dc = item.hDC;
     let r = item.rcItem;
-    fill(dc, &r, 0x00faf9f8);
+    fill(dc, &r, palette.panel);
     let brush = CreateSolidBrush(background);
     let old_brush = SelectObject(dc, brush);
     let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
@@ -255,21 +260,25 @@ impl App {
       std::sync::OnceLock::new();
     let icons = ICONS.get_or_init(|| {
       all_buttons()
-        .map(|(id, _)| {
-          let mut reader = png::Decoder::new(std::io::Cursor::new(icon(*id)))
+        .map(|(id, _)| *id)
+        .chain([1001])
+        .map(|id| {
+          let mut reader = png::Decoder::new(std::io::Cursor::new(icon(id)))
             .read_info()
             .expect("Встроенная иконка");
           let mut pixels = vec![0; reader.output_buffer_size()];
           let info = reader.next_frame(&mut pixels).expect("Встроенная иконка");
           assert_eq!(info.color_type, png::ColorType::Rgba);
-          (
-            *id,
-            pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect(),
-          )
+          (id, pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect())
         })
         .collect()
     });
-    if let Some(alpha) = icons.get(&id) {
+    let icon_id = if id == THEME && theme::current() == theme::Theme::Dark {
+      1001
+    } else {
+      id
+    };
+    if let Some(alpha) = icons.get(&icon_id) {
       let pixels: Vec<u8> = alpha
         .iter()
         .flat_map(|a| {
@@ -336,6 +345,10 @@ mod tests {
         .unwrap();
       assert_eq!((reader.info().width, reader.info().height), (80, 80));
     }
-    assert_eq!(ids.len(), 51);
+    assert_eq!(ids.len(), 52);
+    let reader = png::Decoder::new(std::io::Cursor::new(icon(1001)))
+      .read_info()
+      .unwrap();
+    assert_eq!((reader.info().width, reader.info().height), (80, 80));
   }
 }
