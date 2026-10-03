@@ -181,7 +181,8 @@ pub unsafe fn control_color(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT>
     },
   );
   SetBkColor(dc, bg);
-  SetBkMode(dc, TRANSPARENT as i32);
+  // EDIT перерисовывает часть строки при вводе: прозрачный фон оставляет старые буквы.
+  SetBkMode(dc, if edit { OPAQUE } else { TRANSPARENT } as i32);
   SetDCBrushColor(dc, bg);
   Some(GetStockObject(DC_BRUSH) as isize)
 }
@@ -447,6 +448,50 @@ pub unsafe fn menu_message(hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> 
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn edit_fields_erase_previous_glyphs_in_both_themes() {
+    unsafe {
+      let edit = CreateWindowExW(
+        0,
+        wide("EDIT").as_ptr(),
+        wide("Старый текст").as_ptr(),
+        WS_POPUP | ES_MULTILINE as u32,
+        0,
+        0,
+        200,
+        80,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null(),
+      );
+      assert!(!edit.is_null());
+      let dc = CreateCompatibleDC(ptr::null_mut());
+      assert!(!dc.is_null());
+      let mut results = Vec::new();
+      for theme in [Theme::Light, Theme::Dark] {
+        set(theme);
+        for readonly in [false, true] {
+          SendMessageW(edit, EM_SETREADONLY, readonly as usize, 0);
+          let message = if readonly {
+            WM_CTLCOLORSTATIC
+          } else {
+            WM_CTLCOLOREDIT
+          };
+          control_color(message, dc as usize, edit as isize).unwrap();
+          // При частичной перерисовке EDIT должен закрашивать прежние буквы.
+          results.push((theme, readonly, GetBkMode(dc), GetBkColor(dc)));
+        }
+      }
+      set(Theme::Light);
+      DeleteDC(dc);
+      DestroyWindow(edit);
+      for (theme, readonly, mode, background) in results {
+        assert_eq!(mode, OPAQUE as i32, "{theme:?}, только чтение: {readonly}");
+        assert_eq!(background, colors(theme).field);
+      }
+    }
+  }
   #[test]
   fn theme_preference_round_trips_and_recovers_from_invalid_values() {
     let dir = std::env::temp_dir().join(format!("astra-theme-{}", std::process::id()));
