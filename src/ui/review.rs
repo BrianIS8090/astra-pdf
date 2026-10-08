@@ -16,12 +16,29 @@ pub(super) const SCALE: usize = 127;
 pub(super) const EDIT: usize = 128;
 pub(super) const REMOVE: usize = 129;
 pub(super) const LABEL: usize = 130;
-pub(super) const BUTTONS: [(usize, &str); 10] = [
+pub(super) const INK: usize = 131;
+pub(super) const TEXT: usize = 132;
+pub(super) const COLOR: usize = 133;
+const COLORS: [(&str, [u8; 3]); 7] = [
+  ("Синий", [26, 107, 194]),
+  ("Красный", [211, 47, 47]),
+  ("Зелёный", [36, 128, 68]),
+  ("Оранжевый", [213, 110, 0]),
+  ("Фиолетовый", [123, 65, 181]),
+  ("Чёрный", [25, 25, 25]),
+  ("Белый", [255, 255, 255]),
+];
+pub(super) const BUTTONS: [(usize, &str); 12] = [
   (TOOLS, "Замечания и измерения"),
   (COMMENT, "Комментарий"),
   (RECTANGLE, "Прямоугольник"),
   (ARROW, "Стрелка"),
   (MARKER, "Маркер"),
+  (INK, "Карандаш · рисовать от руки"),
+  (
+    TEXT,
+    "Текстовая заметка · выделите область или нажмите на страницу",
+  ),
   (DISTANCE, "Измерить расстояние"),
   (AREA, "Измерить площадь · Enter — завершить"),
   (SCALE, "Масштаб чертежа"),
@@ -33,6 +50,7 @@ pub(super) struct Review {
   pub open: bool,
   pub mode: Option<usize>,
   pub scale: f64,
+  color: [u8; 3],
   page: usize,
   points: Vec<[f64; 2]>,
   cursor: Option<[f64; 2]>,
@@ -45,6 +63,7 @@ impl Default for Review {
       open: false,
       mode: None,
       scale: 1.,
+      color: COLORS[0].1,
       page: 0,
       points: vec![],
       cursor: None,
@@ -75,7 +94,21 @@ impl Review {
     self.mode.is_some() || self.selected.is_some()
   }
   pub fn probe(&self) -> serde_json::Value {
-    serde_json::json!({"open":self.open,"mode":self.mode,"scale":self.scale,"points":self.points,"selected":self.selected.as_ref().map(|(p,n)|serde_json::json!({"page":p,"index":n.index,"text":n.text}))})
+    serde_json::json!({"open":self.open,"mode":self.mode,"scale":self.scale,"color":self.color,"points":self.points,"selected":self.selected.as_ref().map(|(p,n)|serde_json::json!({"page":p,"index":n.index,"text":n.text,"kind":n.kind}))})
+  }
+  fn stroke_point(&mut self, point: [f64; 2]) {
+    if self
+      .points
+      .last()
+      .is_some_and(|last| (last[0] - point[0]).hypot(last[1] - point[1]) < 0.0005)
+    {
+      return;
+    }
+    // Длинный жест остаётся в пределах памяти; начало и последний участок сохраняются.
+    if self.points.len() >= 4096 {
+      self.points = self.points.iter().step_by(2).copied().collect();
+    }
+    self.points.push(point);
   }
 }
 
@@ -94,13 +127,25 @@ impl App {
       "Масштаб 1:1 · измерения по геометрии PDF",
       0x200,
     );
+    let color = self.create(
+      COLOR,
+      "COMBOBOX",
+      "Цвет карандаша и текста",
+      CBS_DROPDOWNLIST as u32 | WS_VSCROLL,
+    );
+    for (label, _) in COLORS {
+      SendMessageW(color, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+    }
+    SendMessageW(color, CB_SETCURSEL, 0, 0);
   }
 
   pub(super) unsafe fn review_layout(&self, base: i32, tools_x: i32, tools_y: i32) {
     self.place(TOOLS, tools_x + 10 * 36, tools_y, 32, 32);
-    for (i, id) in [COMMENT, RECTANGLE, ARROW, MARKER, DISTANCE, AREA, SCALE]
-      .iter()
-      .enumerate()
+    for (i, id) in [
+      COMMENT, RECTANGLE, ARROW, MARKER, INK, TEXT, DISTANCE, AREA, SCALE,
+    ]
+    .iter()
+    .enumerate()
     {
       self.place(*id, 12 + i as i32 * 36, base + 4, 32, 32);
       ShowWindow(
@@ -108,10 +153,22 @@ impl App {
         if self.review.open { SW_SHOW } else { SW_HIDE },
       );
     }
-    self.place(LABEL, 280, base + 6, 390, 28);
+    self.place(COLOR, 340, base + 4, 128, 200);
+    ShowWindow(
+      self.control(COLOR),
+      if self.review.open { SW_SHOW } else { SW_HIDE },
+    );
+    let mut bounds: RECT = std::mem::zeroed();
+    GetClientRect(self.hwnd, &mut bounds);
+    let label_width = (bounds.right as f64 * 96. / self.dpi as f64) as i32 - 492;
+    self.place(LABEL, 480, base + 6, label_width.max(1), 28);
     ShowWindow(
       self.control(LABEL),
-      if self.review.open { SW_SHOW } else { SW_HIDE },
+      if self.review.open && label_width >= 160 {
+        SW_SHOW
+      } else {
+        SW_HIDE
+      },
     );
     SetWindowTextW(
       self.control(LABEL),
@@ -133,7 +190,7 @@ impl App {
         }
         self.layout();
       }
-      COMMENT | RECTANGLE | ARROW | MARKER | DISTANCE | AREA => {
+      COMMENT | RECTANGLE | ARROW | MARKER | DISTANCE | AREA | INK | TEXT => {
         let was = self.review.mode;
         self.cancel_editor();
         if was != Some(id) {
@@ -141,6 +198,8 @@ impl App {
         }
         self.status=match id {
           COMMENT=>"Нажмите на страницу, чтобы оставить комментарий.",
+          INK=>"Рисуйте левой кнопкой мыши. Цвет — в списке на панели. Ctrl+Z отменяет штрих, Ctrl+S сохраняет в PDF.",
+          TEXT=>"Выделите область для текста или нажмите на страницу. Цвет — в списке на панели. Esc — выключить инструмент.",
           AREA=>"Отметьте вершины контура · Enter — завершить · Backspace — убрать последнюю · Esc — отменить",
           DISTANCE=>"Протяните линию между двумя точками. Сначала установите масштаб чертежа.",
           _=>"Протяните область на странице · Esc — выключить инструмент",
@@ -149,6 +208,13 @@ impl App {
       }
       SCALE | EDIT => {
         PostMessageW(self.hwnd, WM_APP + 29, id, 0);
+      }
+      COLOR => {
+        let index = SendMessageW(self.control(COLOR), CB_GETCURSEL, 0, 0);
+        if let Some((label, color)) = COLORS.get(index.max(0) as usize) {
+          self.review.color = *color;
+          self.status = format!("Цвет нового рисунка и текста: {label}");
+        }
       }
       REMOVE => {
         if let Some((page, note)) = self.review.selected.take() {
@@ -233,6 +299,50 @@ impl App {
         }
       } else if msg == WM_MOUSEMOVE {
         self.review.cursor = Some(p);
+        if mode == INK && !self.review.points.is_empty() {
+          self.review.stroke_point(p);
+        }
+      } else if msg == WM_LBUTTONUP && mode == INK && !self.review.points.is_empty() {
+        self.review.stroke_point(p);
+        let points = std::mem::take(&mut self.review.points);
+        self.review.cursor = None;
+        ReleaseCapture();
+        if points.len() >= 2 {
+          self.apply_operation(
+            Operation::Annotate {
+              note: Note {
+                page,
+                points,
+                kind: Kind::Ink {
+                  color: self.review.color,
+                  width: 2.,
+                },
+              },
+            },
+            None,
+          );
+        }
+      } else if msg == WM_LBUTTONUP && mode == TEXT && self.review.points.len() == 1 {
+        let a = self.review.points[0];
+        let points = if (p[0] - a[0]).hypot(p[1] - a[1]) > 0.002 {
+          vec![a, p]
+        } else {
+          let a = [a[0].min(0.60), a[1].min(0.82)];
+          vec![a, [a[0] + 0.4, a[1] + 0.16]]
+        };
+        self.review.points.clear();
+        self.review.cursor = None;
+        ReleaseCapture();
+        self.review.pending = Some(Note {
+          page,
+          points,
+          kind: Kind::Text {
+            text: String::new(),
+            color: self.review.color,
+            size: 14.,
+          },
+        });
+        PostMessageW(self.hwnd, WM_APP + 29, TEXT, 0);
       } else if msg == WM_LBUTTONUP && mode != AREA && self.review.points.len() == 1 {
         let a = self.review.points[0];
         self.review.points.clear();
@@ -302,7 +412,7 @@ impl App {
     for (i, id) in [EDIT, REMOVE].iter().enumerate() {
       let h = self.control(*id);
       MoveWindow(h, x + i as i32 * (size + 4), y, size, size, 1);
-      EnableWindow(h, (*id != EDIT || kind == 1) as i32);
+      EnableWindow(h, (*id != EDIT || matches!(kind, 1 | 3)) as i32);
       ShowWindow(h, SW_SHOW);
     }
   }
@@ -340,10 +450,27 @@ impl App {
     if points.len() < 2 {
       return;
     }
-    let pen = CreatePen(PS_SOLID, self.unit(2), 0x00c87818);
+    let color = if matches!(self.review.mode, Some(INK | TEXT)) {
+      let [r, g, b] = self.review.color;
+      r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+    } else {
+      0x00c87818
+    };
+    let width = if self.review.mode == Some(INK) {
+      let size = self.sizes[self.review.page];
+      let physical_width = if self.rotation % 2 == 0 {
+        size.0
+      } else {
+        size.1
+      };
+      (2. * layout.width as f64 / physical_width).round().max(1.) as i32
+    } else {
+      self.unit(2)
+    };
+    let pen = CreatePen(PS_SOLID, width, color);
     let old = SelectObject(dc, pen);
     let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    if matches!(self.review.mode, Some(RECTANGLE | MARKER)) {
+    if matches!(self.review.mode, Some(RECTANGLE | MARKER | TEXT)) {
       Rectangle(
         dc,
         points[0].x.min(points[1].x),
@@ -405,12 +532,19 @@ pub(super) unsafe fn dialog(hwnd: HWND, id: usize) {
     } else if let Some(mut note) = with_app(|a| a.review.pending.take()).flatten() {
       if let Some(text) = crate::dialogs::prompt(
         hwnd,
-        "Новый комментарий",
-        "Комментарий будет сохранён в PDF и доступен в других просмотрщиках.",
+        if matches!(note.kind, Kind::Text { .. }) {
+          "Текстовая заметка"
+        } else {
+          "Новый комментарий"
+        },
+        "Заметка будет сохранена в PDF. Ctrl+S сохраняет документ; Ctrl+Z отменяет добавление.",
         "",
         false,
       ) {
-        note.kind = Kind::Comment(text);
+        match &mut note.kind {
+          Kind::Text { text: value, .. } => *value = text,
+          _ => note.kind = Kind::Comment(text),
+        }
         with_app(|a| a.apply_operation(Operation::Annotate { note }, None));
       }
     }
@@ -425,4 +559,26 @@ pub(super) unsafe fn dialog(hwnd: HWND, id: usize) {
     a.layout();
     a.sync_editor_controls();
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  #[test]
+  fn long_stroke_is_bounded_and_escape_clears_only_the_gesture() {
+    let mut review = Review {
+      mode: Some(INK),
+      color: [211, 47, 47],
+      ..Review::default()
+    };
+    for i in 0..12000 {
+      review.stroke_point([i as f64 / 12000., if i % 2 == 0 { 0.2 } else { 0.4 }]);
+    }
+    assert!(review.points.len() <= 4096);
+    assert_eq!(review.points[0], [0., 0.2]);
+    assert_eq!(review.points.last().unwrap()[0], 11999. / 12000.);
+    review.stop();
+    assert!(review.points.is_empty() && review.mode.is_none());
+    assert_eq!(review.color, [211, 47, 47]);
+  }
 }

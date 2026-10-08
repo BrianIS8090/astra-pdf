@@ -3,6 +3,7 @@ mod annotation;
 mod edit;
 mod font;
 mod groups;
+mod note_text;
 mod reading;
 mod text;
 use libloading::Library;

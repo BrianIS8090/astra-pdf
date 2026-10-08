@@ -345,6 +345,7 @@ pub(super) unsafe fn menu(hwnd: HWND) {
     (
       "Страницы",
       vec![
+        (PAGES, "Сохранить выбранные страницы в отдельный PDF…"),
         (pages::DUPLICATE, "Дублировать текущую страницу"),
         (pages::REMOVE, "Удалить текущую страницу"),
         (pages::INSERT, "Вставить страницы из PDF…"),
@@ -376,6 +377,8 @@ pub(super) unsafe fn menu(hwnd: HWND) {
         (review::RECTANGLE, "Прямоугольник"),
         (review::ARROW, "Стрелка"),
         (review::MARKER, "Маркер"),
+        (review::INK, "Карандаш — рисовать от руки"),
+        (review::TEXT, "Добавить цветную текстовую заметку"),
         (review::DISTANCE, "Измерить расстояние"),
         (review::AREA, "Измерить площадь"),
         (review::SCALE, "Масштаб чертежа…"),
@@ -1634,6 +1637,9 @@ unsafe fn command_inner(hwnd: HWND, id: usize) -> Result<(), String> {
       });
     }
     PAGES => {
+      if !masks.is_empty() {
+        return Err("Есть области скрытия. Сначала сохраните очищенный PDF и откройте его для сохранения отдельных страниц.".into());
+      }
       let Some(range) = dialogs::prompt(hwnd,"Сохранить страницы",&format!("Всего страниц: {count}. Введите номера или диапазоны, например: 1, 3-5.\nПорядок как в исходнике; без повторов. Сохраняются исходные слои."),&(page+1).to_string(),false) else { return Ok(()); };
       let pages = crate::editing::pages(&range, count)?;
       let Some(output) = output_pdf(hwnd, &logical, "Сохранить выбранные страницы", "страницы")?

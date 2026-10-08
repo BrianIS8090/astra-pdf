@@ -122,7 +122,7 @@ pub fn pages(input: &str, count: usize) -> Result<Vec<usize>, String> {
     Ok(n - 1)
   };
   for part in input.split([',', ';']) {
-    let pair: Vec<_> = part.trim().split('-').collect();
+    let pair: Vec<_> = part.trim().split(['-', '–', '—']).collect();
     let first = number(pair[0])?;
     let last = match pair.len() {
       1 => first,
@@ -464,6 +464,7 @@ mod tests {
   #[test]
   fn ranges_are_validated_and_deduplicated() {
     assert_eq!(pages("3, 1; 2-3", 3).unwrap(), vec![0, 1, 2]);
+    assert_eq!(pages("1, 2–3", 3).unwrap(), vec![0, 1, 2]);
     for s in [
       "",
       "0",

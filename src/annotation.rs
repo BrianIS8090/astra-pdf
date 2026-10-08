@@ -6,8 +6,21 @@ pub enum Kind {
   Rectangle,
   Arrow,
   Highlight,
-  Distance { scale: f64 },
-  Area { scale: f64 },
+  Ink {
+    color: [u8; 3],
+    width: f64,
+  },
+  Text {
+    text: String,
+    color: [u8; 3],
+    size: f64,
+  },
+  Distance {
+    scale: f64,
+  },
+  Area {
+    scale: f64,
+  },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Note {
@@ -19,7 +32,12 @@ impl Note {
   pub fn valid(&self, pages: usize) -> bool {
     if self.page >= pages
       || self.points.is_empty()
-      || self.points.len() > 256
+      || self.points.len()
+        > if matches!(self.kind, Kind::Ink { .. }) {
+          4096
+        } else {
+          256
+        }
       || self
         .points
         .iter()
@@ -31,6 +49,18 @@ impl Note {
     match &self.kind {
       Kind::Comment(text) => {
         self.points.len() == 1 && !text.trim().is_empty() && text.len() <= 16_384
+      }
+      Kind::Ink { width, .. } => {
+        self.points.len() >= 2 && width.is_finite() && (0.5..=12.).contains(width)
+      }
+      Kind::Text { text, size, .. } => {
+        self.points.len() == 2
+          && !text.trim().is_empty()
+          && text.len() <= 16_384
+          && size.is_finite()
+          && (8. ..=72.).contains(size)
+          && (self.points[0][0] - self.points[1][0]).abs() > 0.001
+          && (self.points[0][1] - self.points[1][1]).abs() > 0.001
       }
       Kind::Distance { scale } => {
         self.points.len() == 2 && scale.is_finite() && (0.001..=100_000.).contains(scale)
@@ -92,6 +122,36 @@ impl Note {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[test]
+  fn freehand_and_text_validate_geometry_and_limits() {
+    let mut note = Note {
+      page: 0,
+      points: vec![[0.1, 0.2]; 1000],
+      kind: Kind::Ink {
+        color: [220, 40, 40],
+        width: 2.,
+      },
+    };
+    assert!(note.valid(1));
+    note.points.resize(4097, [0.3, 0.4]);
+    assert!(!note.valid(1));
+    note.points = vec![[0.1, 0.2], [0.5, 0.4]];
+    note.kind = Kind::Text {
+      text: "Цветная заметка".into(),
+      color: [20, 100, 220],
+      size: 14.,
+    };
+    assert!(note.valid(1));
+    note.points[1] = note.points[0];
+    assert!(!note.valid(1));
+    note.points[1] = [0.5, 0.4];
+    note.kind = Kind::Text {
+      text: " ".into(),
+      color: [0, 0, 0],
+      size: 14.,
+    };
+    assert!(!note.valid(1));
+  }
   #[test]
   fn measurements_use_physical_page_size_and_scale_once_per_axis() {
     let mut note = Note {
