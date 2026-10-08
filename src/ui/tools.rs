@@ -100,6 +100,9 @@ fn icon(id: usize) -> &'static [u8] {
     127 => include_bytes!("../../assets/lucide/scan.png"),
     128 => include_bytes!("../../assets/lucide/text-cursor-input.png"),
     129 => include_bytes!("../../assets/lucide/trash.png"),
+    131 => include_bytes!("../../assets/lucide/pencil.png"),
+    132 => include_bytes!("../../assets/lucide/type.png"),
+    40 => include_bytes!("../../assets/lucide/file-down.png"),
     90 => include_bytes!("../../assets/lucide/trash.png"),
     91 => include_bytes!("../../assets/lucide/copy-plus.png"),
     92 => include_bytes!("../../assets/lucide/file-plus.png"),
@@ -345,7 +348,7 @@ mod tests {
         .unwrap();
       assert_eq!((reader.info().width, reader.info().height), (80, 80));
     }
-    assert_eq!(ids.len(), 52);
+    assert_eq!(ids.len(), 55);
     let reader = png::Decoder::new(std::io::Cursor::new(icon(1001)))
       .read_info()
       .unwrap();

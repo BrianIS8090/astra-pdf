@@ -1134,7 +1134,7 @@ impl App {
       }
       return;
     }
-    if (review::TOOLS..=review::REMOVE).contains(&id) {
+    if (review::TOOLS..=review::COLOR).contains(&id) {
       self.review_action(id);
       return;
     }
@@ -2276,7 +2276,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if index >= 0 {
           app.navigate(index as usize);
         }
-      } else if (id == VIEW_MODE && notification == CBN_SELCHANGE) || notification == BN_CLICKED {
+      } else if ((id == VIEW_MODE || id == review::COLOR) && notification == CBN_SELCHANGE)
+        || notification == BN_CLICKED
+      {
         app.action(id);
       }
       Some(0)

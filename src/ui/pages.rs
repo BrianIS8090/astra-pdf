@@ -7,13 +7,17 @@ pub(super) const INSERT: usize = 92;
 pub(super) const MERGE: usize = 93;
 pub(super) const UP: usize = 94;
 pub(super) const DOWN: usize = 95;
-pub(super) const BUTTONS: [(usize, &str); 6] = [
+pub(super) const BUTTONS: [(usize, &str); 7] = [
   (DUPLICATE, "Дублировать страницу"),
   (REMOVE, "Удалить страницу"),
   (INSERT, "Вставить страницы из PDF"),
   (MERGE, "Объединить с PDF"),
   (UP, "Переместить страницу выше"),
   (DOWN, "Переместить страницу ниже"),
+  (
+    editor::PAGES,
+    "Сохранить выбранные страницы в отдельный PDF",
+  ),
 ];
 
 impl App {
@@ -26,7 +30,11 @@ impl App {
 
   pub(super) unsafe fn pages_layout(&self, top: i32) {
     for (i, (id, _)) in BUTTONS.iter().enumerate() {
-      self.place(*id, 12 + i as i32 * 36, top + 86, 32, 32);
+      if *id == editor::PAGES {
+        self.place(*id, 200, top + 10, 28, 32);
+      } else {
+        self.place(*id, 12 + i as i32 * 36, top + 86, 32, 32);
+      }
       ShowWindow(
         self.control(*id),
         if !self.layer_tab && !self.reader.bookmarks_open {

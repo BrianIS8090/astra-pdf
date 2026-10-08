@@ -31,6 +31,12 @@ def run(exe, output, documents):
   synthetic = output / 'drawing.pdf'
   drawing(synthetic)
   report = {'checks': [], 'documents': []}
+  def details_ready(state):
+    # Основной кадр может быть готов раньше видимых детальных участков страницы.
+    _, _, width, height = next(p for p in state['page_boxes'] if p[0] == state['page'])
+    if width * height <= 8_000_000:
+      return state['image_size'] == [width, height] and state['tiles_visible'] == 0
+    return state['tiles_visible'] > 0 and state['tiles_ready'] == state['tiles_visible']
   for index, document in enumerate([synthetic] + documents):
     fingerprint = hashlib.sha256(document.read_bytes()).hexdigest()
     viewer = Viewer(exe, document, output / f'document-{index}.json')
@@ -49,7 +55,7 @@ def run(exe, output, documents):
           viewer.command(15)
         immediate = viewer.snapshot()
         assert immediate['preview_available'], 'Во время увеличения пропал обзор страницы'
-        state = viewer.ready()
+        state = viewer.ready(details_ready)
         elapsed = (time.perf_counter() - begun) * 1000
         assert state['scale'] >= target - .001 and not state['error']
         _, _, width, height = next(p for p in state['page_boxes'] if p[0] == state['page'])
@@ -76,15 +82,15 @@ def run(exe, output, documents):
       before = viewer.snapshot()['scroll']
       begun = time.perf_counter()
       send(canvas, 0x114, 3)
-      pan = viewer.ready()
+      pan = viewer.ready(details_ready)
       assert pan['scroll'][0] > before[0] and pan['tiles_ready'] == pan['tiles_visible']
       measurements['new_area_ms'] = round((time.perf_counter()-begun)*1000)
       begun = time.perf_counter()
       send(canvas, 0x114, 2)
-      assert viewer.ready()['scroll'] == before
+      assert viewer.ready(details_ready)['scroll'] == before
       measurements['cached_area_ms'] = round((time.perf_counter()-begun)*1000)
       viewer.command(18)
-      rotated = viewer.ready()
+      rotated = viewer.ready(details_ready)
       assert rotated['rotation'] == 1 and rotated['tiles_ready'] == rotated['tiles_visible']
       send(mode, 0x14e, 0)
       viewer.command(28)

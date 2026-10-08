@@ -42,7 +42,59 @@ impl Pdf {
         .as_dict()
         .map_err(|e| e.to_string())?
         .clone();
-      if annotation.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"Text") {
+      let subtype = annotation
+        .get(b"Subtype")
+        .and_then(Object::as_name)
+        .map_err(|e| e.to_string())?
+        .to_vec();
+      if subtype == b"FreeText" {
+        if !annotation.has(b"AstraTextSize") {
+          return Err(
+            "Изменение оформления текстовой заметки другой программы пока не поддерживается."
+              .into(),
+          );
+        }
+        let rect = annotation
+          .get(b"Rect")
+          .and_then(Object::as_array)
+          .map_err(|e| e.to_string())?;
+        let rect: Vec<_> = rect
+          .iter()
+          .map(|v| v.as_float().map(|n| n as f64))
+          .collect::<Result<_, _>>()
+          .map_err(|e| e.to_string())?;
+        if rect.len() != 4 {
+          return Err("Неверные границы текстовой заметки.".into());
+        }
+        let size = annotation
+          .get(b"AstraTextSize")
+          .and_then(Object::as_float)
+          .unwrap_or(14.) as f64;
+        if !size.is_finite() || !(8. ..=72.).contains(&size) {
+          return Err("Недопустимый размер текста заметки.".into());
+        }
+        let color = annotation
+          .get(b"AstraTextColor")
+          .and_then(Object::as_array)
+          .ok()
+          .filter(|v| v.len() == 3)
+          .map(|v| {
+            std::array::from_fn(|i| {
+              (v[i].as_float().unwrap_or(0.).clamp(0., 1.) * 255.).round() as u8
+            })
+          })
+          .unwrap_or([0, 0, 0]);
+        let (appearance, da) = super::note_text::appearance(
+          &mut doc,
+          rect[2] - rect[0],
+          rect[3] - rect[1],
+          text,
+          color,
+          size,
+        )?;
+        annotation.set("AP", dictionary! {"N"=>appearance});
+        annotation.set("DA", Object::string_literal(da));
+      } else if subtype != b"Text" {
         return Err("Изменение текста доступно у заметки с иконкой комментария.".into());
       }
       annotation.set("Contents", unicode(text));
@@ -117,11 +169,16 @@ impl Pdf {
       right = right.max(left + 110.);
       top += 18.;
     }
-    if !matches!(note.kind, Kind::Highlight) {
-      left -= 4.;
-      right += 4.;
-      bottom -= 4.;
-      top += 4.;
+    if !matches!(note.kind, Kind::Highlight | Kind::Text { .. }) {
+      let padding = if let Kind::Ink { width, .. } = note.kind {
+        width / 2. + 2.
+      } else {
+        4.
+      };
+      left -= padding;
+      right += padding;
+      bottom -= padding;
+      top += padding;
     }
     let width = (right - left).max(0.01);
     let height = (top - bottom).max(0.01);
@@ -130,6 +187,59 @@ impl Pdf {
     let mut annotation = dictionary! {"Type"=>"Annot","P"=>page_id,"F"=>4,"Rect"=>vec![Object::Real(left as f32),Object::Real(bottom as f32),Object::Real(right as f32),Object::Real(top as f32)],"T"=>unicode("Astra PDF"),"NM"=>Object::string_literal(crate::vault::random::<16>()?.iter().map(|b|format!("{b:02x}")).collect::<String>()),"C"=>vec![Object::Real(0.10),Object::Real(0.42),Object::Real(0.76)],"Border"=>vec![0.into(),0.into(),1.into()]};
     let mut alpha = 1.;
     match &note.kind {
+      Kind::Ink {
+        color,
+        width: stroke,
+      } => {
+        annotation.set("Subtype", "Ink");
+        annotation.set(
+          "C",
+          color
+            .iter()
+            .map(|v| Object::Real(*v as f32 / 255.))
+            .collect::<Vec<_>>(),
+        );
+        annotation.set(
+          "BS",
+          dictionary! {"Type"=>"Border", "W"=>Object::Real(*stroke as f32), "S"=>"S"},
+        );
+        annotation.set(
+          "InkList",
+          vec![Object::Array(
+            points
+              .iter()
+              .flat_map(|p| [Object::Real(p.0 as f32), Object::Real(p.1 as f32)])
+              .collect(),
+          )],
+        );
+        let rgb = color.map(|v| v as f64 / 255.);
+        commands.push_str(&format!(
+          "{} {} {} RG {stroke} w 1 J 1 j {} {} m\n",
+          rgb[0], rgb[1], rgb[2], xy[0].0, xy[0].1
+        ));
+        for p in xy.iter().skip(1) {
+          commands.push_str(&format!("{} {} l\n", p.0, p.1));
+        }
+        commands.push_str("S\n");
+      }
+      Kind::Text { text, color, size } => {
+        annotation.set("Subtype", "FreeText");
+        annotation.set("Contents", unicode(text));
+        // У FreeText C задаёт фон, а цвет букв записывается в DA и представление AP.
+        annotation.set("C", Vec::<Object>::new());
+        annotation.set(
+          "AstraTextColor",
+          color
+            .iter()
+            .map(|v| Object::Real(*v as f32 / 255.))
+            .collect::<Vec<_>>(),
+        );
+        annotation.set("AstraTextSize", Object::Real(*size as f32));
+        annotation.set("Border", vec![0.into(), 0.into(), 0.into()]);
+        annotation.set("BS", dictionary! {"W"=>0});
+        annotation.set("IT", "FreeTextTypeWriter");
+        annotation.set("Q", 0);
+      }
       Kind::Comment(value) => {
         annotation.set("Subtype", "Text");
         annotation.set("Name", "Comment");
@@ -232,7 +342,14 @@ impl Pdf {
     let state = dictionary! {"Type"=>"ExtGState","CA"=>Object::Real(alpha),"ca"=>Object::Real(alpha),"BM"=>if matches!(note.kind,Kind::Highlight){"Multiply"}else{"Normal"}};
     let resources =
       dictionary! {"Font"=>dictionary!{"F1"=>font},"ExtGState"=>dictionary!{"GS"=>state}};
-    let appearance=doc.add_object(Stream::new(dictionary!{"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),Object::Real(width as f32),Object::Real(height as f32)],"Resources"=>resources},commands.into_bytes()));
+    let appearance = if let Kind::Text { text, color, size } = &note.kind {
+      let (appearance, da) =
+        super::note_text::appearance(&mut doc, width, height, text, *color, *size)?;
+      annotation.set("DA", Object::string_literal(da));
+      appearance
+    } else {
+      doc.add_object(Stream::new(dictionary!{"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),Object::Real(width as f32),Object::Real(height as f32)],"Resources"=>resources},commands.into_bytes()))
+    };
     annotation.set("AP", dictionary! {"N"=>appearance});
     let annotation = doc.add_object(annotation);
     let mut list = doc
@@ -272,6 +389,15 @@ mod tests {
       Kind::Rectangle,
       Kind::Arrow,
       Kind::Highlight,
+      Kind::Ink {
+        color: [211, 47, 47],
+        width: 2.,
+      },
+      Kind::Text {
+        text: "Цветная заметка\nВторая строка".into(),
+        color: [123, 65, 181],
+        size: 14.,
+      },
       Kind::Distance { scale: 100. },
       Kind::Area { scale: 100. },
     ] {
@@ -284,12 +410,33 @@ mod tests {
         .annotate(&Note {
           page: 0,
           points,
-          kind,
+          kind: kind.clone(),
         })
         .unwrap();
       let doc = lopdf::Document::load_mem(&bytes).unwrap();
       let id = doc.get_pages()[&1];
       assert_eq!(doc.get_page_annotations(id).unwrap().len(), 1);
+      let annotation = doc.get_page_annotations(id).unwrap()[0];
+      if let Kind::Ink { .. } = kind {
+        assert_eq!(
+          annotation.get(b"Subtype").unwrap().as_name().unwrap(),
+          b"Ink"
+        );
+        assert_eq!(
+          annotation.get(b"InkList").unwrap().as_array().unwrap()[0]
+            .as_array()
+            .unwrap()
+            .len(),
+          4
+        );
+      }
+      if let Kind::Text { .. } = kind {
+        assert_eq!(
+          annotation.get(b"Subtype").unwrap().as_name().unwrap(),
+          b"FreeText"
+        );
+        assert!(annotation.has(b"DA"));
+      }
       let after = Pdf::open(api.clone(), Arc::new(bytes)).unwrap();
       assert_ne!(
         after.render(0, 600, 800, 0, false).unwrap().pixels,
@@ -304,5 +451,59 @@ mod tests {
         pdf.read_page(0).unwrap().glyphs.len()
       );
     }
+  }
+  #[test]
+  fn free_text_edit_keeps_color_and_font_and_rejects_overflow() {
+    let api = Api::new(&crate::pdfium_path()).unwrap();
+    let pdf = Pdf::open(api.clone(), Arc::new(crate::fixture::demo())).unwrap();
+    let note = Note {
+      page: 0,
+      points: vec![[0.1, 0.2], [0.7, 0.4]],
+      kind: Kind::Text {
+        text: "Исходная заметка".into(),
+        color: [211, 47, 47],
+        size: 14.,
+      },
+    };
+    let annotated = Pdf::open(api.clone(), Arc::new(pdf.annotate(&note).unwrap())).unwrap();
+    let bytes = annotated
+      .edit_note(0, 0, Some("Обновлённая заметка\nДругая строка"))
+      .unwrap();
+    let doc = lopdf::Document::load_mem(&bytes).unwrap();
+    let annotation = doc.get_page_annotations(doc.get_pages()[&1]).unwrap()[0];
+    assert_eq!(
+      annotation.get(b"Subtype").unwrap().as_name().unwrap(),
+      b"FreeText"
+    );
+    assert_eq!(
+      annotation
+        .get(b"AstraTextSize")
+        .unwrap()
+        .as_float()
+        .unwrap(),
+      14.
+    );
+    assert!(
+      (annotation
+        .get(b"AstraTextColor")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .as_float()
+        .unwrap()
+        - 211. / 255.)
+        .abs()
+        < 0.001
+    );
+    let reopened = Pdf::open(api, Arc::new(bytes)).unwrap();
+    let read = reopened.read_page(0).unwrap();
+    assert!(read
+      .notes
+      .iter()
+      .any(|n| n.kind == 3 && n.text.contains("Обновлённая")));
+    assert!(reopened
+      .edit_note(0, 0, Some(&"Очень длинный текст ".repeat(300)))
+      .is_err());
+    assert!(reopened.edit_note(0, 0, Some(" ")).is_err());
   }
 }

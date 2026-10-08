@@ -69,6 +69,8 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка управления страницами' }
   & $Python "$PSScriptRoot\verify_review_ui.py" $exe $demo "$outputDir\review-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка замечаний и измерений' }
+  & $Python "$PSScriptRoot\verify_markup_ui.py" $exe $demo "$outputDir\markup-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка рисунков, цветного текста и сохранения выбранных страниц' }
   & $Python "$PSScriptRoot\verify_navigation_ui.py" $exe "$outputDir\navigation-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка ссылок, закладок и места чтения' }
   & $Python "$PSScriptRoot\verify_zoom_return.py" $exe "$outputDir\zoom-return"
