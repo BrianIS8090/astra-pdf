@@ -46,6 +46,8 @@ try {
   $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
   $demo = Join-Path $outputDir 'Слои и страницы.pdf'
   Invoke-Viewer @('--demo', (Quoted $demo))
+  & $Python "$PSScriptRoot\verify_toolbar_refresh.py" $exe "$outputDir\toolbar-refresh-ui"
+  if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка доступности и отрисовки кнопок панели' }
   & $Python "$PSScriptRoot\verify_theme.py" $exe $demo "$outputDir\theme-ui"
   if ($LASTEXITCODE -ne 0) { throw 'Не прошла проверка тем, сохранения выбора и неизменности PDF' }
   $sourceHash = (Get-FileHash -LiteralPath $demo).Hash

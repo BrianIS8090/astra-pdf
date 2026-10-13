@@ -412,7 +412,7 @@ impl App {
     for (i, id) in [EDIT, REMOVE].iter().enumerate() {
       let h = self.control(*id);
       MoveWindow(h, x + i as i32 * (size + 4), y, size, size, 1);
-      EnableWindow(h, (*id != EDIT || matches!(kind, 1 | 3)) as i32);
+      tools::enable_control(h, *id != EDIT || matches!(kind, 1 | 3));
       ShowWindow(h, SW_SHOW);
     }
   }
