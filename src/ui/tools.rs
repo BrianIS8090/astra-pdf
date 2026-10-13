@@ -47,6 +47,15 @@ pub(super) fn is_button(id: usize) -> bool {
   all_buttons().any(|(i, _)| *i == id)
 }
 
+pub(super) unsafe fn enable_control(hwnd: HWND, enabled: bool) {
+  let changed = (IsWindowEnabled(hwnd) != 0) != enabled;
+  EnableWindow(hwnd, enabled as i32);
+  if changed && is_button(GetDlgCtrlID(hwnd) as usize) {
+    // Отложенная отрисовка выполняется после освобождения состояния приложения.
+    InvalidateRect(hwnd, ptr::null(), 0);
+  }
+}
+
 fn all_buttons() -> impl Iterator<Item = &'static (usize, &'static str)> {
   BAR
     .iter()
@@ -330,6 +339,25 @@ impl App {
           right: r.right - 3,
           bottom: r.bottom - 3,
         },
+      );
+    }
+    if self.probe.is_some() {
+      // Наблюдение сохраняет завершённую отрисовку; запрос состояния не рисует окно.
+      let mut paints = self.button_paints.borrow_mut();
+      let count = paints
+        .get(&id)
+        .and_then(|p| p["count"].as_u64())
+        .unwrap_or(0)
+        + 1;
+      paints.insert(
+        id,
+        serde_json::json!({
+          "drawn_disabled": disabled,
+          "item_state": item.itemState,
+          "foreground": foreground,
+          "hover": hover,
+          "count": count
+        }),
       );
     }
   }

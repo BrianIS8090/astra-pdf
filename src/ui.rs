@@ -110,6 +110,7 @@ struct App {
   smoke: Option<PathBuf>,
   smoke_stage: u8,
   probe: Option<PathBuf>,
+  button_paints: RefCell<std::collections::BTreeMap<usize, serde_json::Value>>,
   opened_at: std::time::Instant,
   first_frame_ms: Option<u128>,
   last_error: bool,
@@ -529,7 +530,7 @@ impl App {
     let loaded = !self.sizes.is_empty();
     for (id, h) in &self.controls {
       if *id == THEME {
-        EnableWindow(*h, 1);
+        tools::enable_control(*h, true);
         continue;
       }
       let enabled = match *id {
@@ -554,7 +555,7 @@ impl App {
         RESET | LAYER_LIST => !self.layers.is_empty() && !self.printing,
         _ => loaded,
       };
-      EnableWindow(*h, (enabled && (!self.editor.busy || *id == CANCEL)) as i32);
+      tools::enable_control(*h, enabled && (!self.editor.busy || *id == CANCEL));
     }
   }
 
@@ -2086,6 +2087,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         let mut report: serde_json::Value = serde_json::from_str(&report).unwrap();
         report["editor"] = a.editor.probe();
         report["theme"] = serde_json::json!(theme::current().name());
+        report["button_paints"] = serde_json::json!(a
+          .button_paints
+          .borrow()
+          .iter()
+          .map(|(&id, paint)| {
+            let mut paint = paint.clone();
+            paint["enabled"] = serde_json::json!(IsWindowEnabled(a.control(id)) != 0);
+            paint["visible"] = serde_json::json!(IsWindowVisible(a.control(id)) != 0);
+            (id.to_string(), paint)
+          })
+          .collect::<std::collections::BTreeMap<_, _>>());
         report["page_render_counts"] = serde_json::json!(a.page_render_counts);
         report["placeholder_paints"] = serde_json::json!(a.placeholder_paints.get());
         report["refreshing_revision"] = serde_json::json!(a.refreshing_revision);
@@ -2737,6 +2749,7 @@ pub fn run(
       smoke,
       smoke_stage: 0,
       probe,
+      button_paints: RefCell::new(std::collections::BTreeMap::new()),
       opened_at: std::time::Instant::now(),
       first_frame_ms: None,
       last_error: false,

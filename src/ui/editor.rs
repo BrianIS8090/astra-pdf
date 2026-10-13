@@ -809,7 +809,7 @@ impl App {
         height,
         1,
       );
-      EnableWindow(h, (*id != CHANGE_TEXT || is_text) as i32);
+      tools::enable_control(h, *id != CHANGE_TEXT || is_text);
       SetWindowPos(
         h,
         HWND_TOP,
